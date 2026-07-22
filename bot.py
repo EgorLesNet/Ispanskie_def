@@ -30,32 +30,73 @@ def has_cn_or_ar(text):
     return bool(CHINESE_RE.search(text) or ARABIC_RE.search(text))
 
 # ─────────────────────────────────────────────
+# SWEAR FILTER
+# ─────────────────────────────────────────────
+# Базовый список мата (корни слов, регистронезависимо)
+DEFAULT_SWEAR_WORDS = [
+    "блять", "бля", "блядь", "блин",
+    "пизд", "пиздец", "пиздит", "пиздёж",
+    "хуй", "хуйня", "хуйло", "хуёво",
+    "ёбан", "ёб", "еб", "ебать", "ебал", "ебись",
+    "пиздануть", "распиздяй",
+    "мудак", "мудило",
+    "сука", "сучара", "суч",
+    "залупа", "залупен",
+    "шлюха", "шлюшка",
+    "ёбнутый", "ёбнут",
+    "пиздануть", "выёбываться",
+    "нахуй", "нахер",
+    "охуеть", "охуен", "охуит",
+    "ахуеть", "ахуен",
+    "пиздануть", "пиздатый",
+    "ёблан", "долбоёб", "долбоёба",
+    "пиздабол", "пиздёж",
+    "выблядок", "байстрюк",
+    "хуесос", "хуесоска",
+    "пиздострадатель",
+]
+SWEAR_REPLY = "Мы культурный чат, мы не материмся! 🤐"
+
+# ─────────────────────────────────────────────
 # DB
 # ─────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
 
 DEFAULT_DB = {
     "verified_users": [],
-    "stats": {"cn_ar": 0, "flood": 0, "total": 0, "captcha_fail": 0, "msg_deleted": 0, "copypaste": 0},
-    "kick_log": []
+    "stats": {"cn_ar": 0, "flood": 0, "total": 0, "captcha_fail": 0, "msg_deleted": 0, "copypaste": 0, "swear": 0},
+    "kick_log": [],
+    "settings": {
+        "flood_threshold": None,
+        "flood_window": None,
+        "captcha_timeout": 120,
+        "copypaste_limit": 3
+    },
+    "whitelist": [],
+    "connected_channels": {},
+    "swear_words": None
 }
 
 def db_read() -> dict:
     if not os.path.exists(DB_PATH):
-        return {k: v for k, v in DEFAULT_DB.items()}
+        return {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+                for k, v in DEFAULT_DB.items()}
     try:
         with open(DB_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # Дополняем отсутствующие поля если старый db.json
         for k, v in DEFAULT_DB.items():
             if k not in data:
                 data[k] = v
-        if "copypaste" not in data.get("stats", {}):
-            data["stats"]["copypaste"] = 0
+        s = data.get("stats", {})
+        for key in DEFAULT_DB["stats"]:
+            if key not in s:
+                s[key] = 0
+        data["stats"] = s
         return data
     except Exception as e:
         logging.warning("db_read error: %s", e)
-        return {k: v for k, v in DEFAULT_DB.items()}
+        return {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+                for k, v in DEFAULT_DB.items()}
 
 def db_write(data: dict):
     try:
@@ -75,42 +116,68 @@ def db_save_stats():
     d["stats"] = stats
     db_write(d)
 
+def db_save_settings():
+    d = db_read()
+    d["settings"] = {
+        "flood_threshold": flood_threshold,
+        "flood_window": flood_window,
+        "captcha_timeout": CAPTCHA_TIMEOUT,
+        "copypaste_limit": COPYPASTE_LIMIT
+    }
+    db_write(d)
+
+def db_save_whitelist():
+    d = db_read()
+    d["whitelist"] = list(whitelist)
+    db_write(d)
+
+def db_save_channels():
+    d = db_read()
+    d["connected_channels"] = {str(k): v for k, v in connected_channels.items()}
+    db_write(d)
+
+def db_save_swear_words():
+    d = db_read()
+    d["swear_words"] = list(swear_words)
+    db_write(d)
+
 def db_add_kick_log(entry: dict):
-    """entry: {user_id, name, chat_id, chat_title, reason, ts}"""
     d = db_read()
     log = d.get("kick_log", [])
     log.append(entry)
-    # Храним не более 1000 записей
     if len(log) > 1000:
         log = log[-1000:]
     d["kick_log"] = log
     db_write(d)
 
-# --- Runtime state ---
+# ─────────────────────────────────────────────
+# INIT RUNTIME STATE FROM DB
+# ─────────────────────────────────────────────
 _db_init = db_read()
 verified_users = set(tuple(pair) for pair in _db_init.get("verified_users", []))
 stats = _db_init.get("stats", dict(DEFAULT_DB["stats"]))
+whitelist = set(_db_init.get("whitelist", []))
+connected_channels = {int(k): v for k, v in _db_init.get("connected_channels", {}).items()}
 
-logging.info("Loaded %d verified users from db.json", len(verified_users))
-logging.info("Loaded stats from db.json: %s", stats)
+_settings = _db_init.get("settings", {})
+flood_threshold = _settings.get("flood_threshold") or config.FLOOD_THRESHOLD
+flood_window = _settings.get("flood_window") or config.FLOOD_WINDOW
+CAPTCHA_TIMEOUT = _settings.get("captcha_timeout", 120)
+COPYPASTE_LIMIT = _settings.get("copypaste_limit", 3)
+
+_sw = _db_init.get("swear_words")
+swear_words = set(_sw) if _sw is not None else set(DEFAULT_SWEAR_WORDS)
+
+logging.info("Loaded %d verified users, %d whitelist, %d channels from db.json",
+             len(verified_users), len(whitelist), len(connected_channels))
 
 # join_flood: {chat_id: deque of (timestamp, user_id, full_name)}
 join_flood = {}
-whitelist = set()
-flood_threshold = config.FLOOD_THRESHOLD
-flood_window = config.FLOOD_WINDOW
-
-connected_channels = {}
 captcha_pending = {}  # (chat_id, user_id) -> {msg_id, expire, answer}
+copypaste_tracker = {}  # (chat_id, user_id): deque of (ts, hash)
 
-# copy-paste flood: {(chat_id, user_id): deque of (timestamp, text_hash)}
-copypaste_tracker = {}
-COPYPASTE_LIMIT = 3      # сколько одинаковых сообщений подря��
-
-CAPTCHA_TIMEOUT = 120
 CAPTCHA_SUCCESS_DELETE_AFTER = 20
 
-# Сервисные типы для автоудаления
 SERVICE_CONTENT_TYPES = {
     ContentType.NEW_CHAT_MEMBERS,
     ContentType.LEFT_CHAT_MEMBER,
@@ -128,10 +195,25 @@ def is_admin(user_id):
     return user_id in config.ADMIN_IDS
 
 # ─────────────────────────────────────────────
+# SWEAR DETECTION
+# ─────────────────────────────────────────────
+def _build_swear_re(words):
+    if not words:
+        return None
+    pattern = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
+    return re.compile(pattern, re.IGNORECASE)
+
+swear_re = _build_swear_re(swear_words)
+
+def has_swear(text: str) -> bool:
+    if not swear_re or not text:
+        return False
+    return bool(swear_re.search(text))
+
+# ─────────────────────────────────────────────
 # MATH CAPTCHA
 # ─────────────────────────────────────────────
 def gen_math_captcha():
-    """Generate a simple math question and return (question_str, correct_answer, wrong_answers_list)"""
     a = random.randint(1, 15)
     b = random.randint(1, 15)
     op = random.choice(["+", "-", "*"])
@@ -139,7 +221,6 @@ def gen_math_captcha():
         answer = a + b
         question = "{} + {}".format(a, b)
     elif op == "-":
-        # чтобы не было отрицательных
         if a < b:
             a, b = b, a
         answer = a - b
@@ -149,8 +230,6 @@ def gen_math_captcha():
         b = random.randint(2, 9)
         answer = a * b
         question = "{} × {}".format(a, b)
-
-    # 3 неправильных ответа
     wrong = set()
     while len(wrong) < 3:
         delta = random.choice([-3, -2, -1, 1, 2, 3])
@@ -169,16 +248,12 @@ def make_captcha_keyboard(chat_id, user_id, correct, wrongs):
         )
         for opt in options
     ]
-    # В 2 ряда по 2
     return InlineKeyboardMarkup(inline_keyboard=[buttons[:2], buttons[2:]])
 
 # ─────────────────────────────────────────────
 # COPY-PASTE FLOOD
 # ─────────────────────────────────────────────
 def check_copypaste(chat_id: int, user_id: int, text: str) -> bool:
-    """
-    Возвращает True, если пользователь превысил COPYPASTE_LIMIT одинаковых сообщений подряд.
-    """
     if not text or len(text.strip()) < 5:
         return False
     key = (chat_id, user_id)
@@ -187,10 +262,8 @@ def check_copypaste(chat_id: int, user_id: int, text: str) -> bool:
     if key not in copypaste_tracker:
         copypaste_tracker[key] = deque()
     q = copypaste_tracker[key]
-    # убираем записи старше 60 сек
     while q and now - q[0][0] > 60:
         q.popleft()
-    # если последний хэш не совпадает — сбрасываем цепочку
     if q and q[-1][1] != text_hash:
         q.clear()
     q.append((now, text_hash))
@@ -215,8 +288,7 @@ def track_flood_join(chat_id: int, user_id: int, full_name: str):
         return True, to_kick
     elif is_flood:
         return True, [(user_id, full_name)]
-    else:
-        return False, []
+    return False, []
 
 async def _delete_message_after(chat_id: int, message_id: int, delay: int):
     await asyncio.sleep(delay)
@@ -226,15 +298,14 @@ async def _delete_message_after(chat_id: int, message_id: int, delay: int):
         pass
 
 def _kick_log(user_id, name, chat_id, chat_title, reason):
-    entry = {
+    db_add_kick_log({
         "user_id": user_id,
         "name": name,
         "chat_id": chat_id,
         "chat_title": chat_title or str(chat_id),
         "reason": reason,
         "ts": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    db_add_kick_log(entry)
+    })
 
 # ─────────────────────────────────────────────
 # NEW MEMBER HANDLER
@@ -248,7 +319,7 @@ async def on_new_member(event: ChatMemberUpdated):
 
     if user_id == (await bot.get_me()).id:
         connected_channels[chat_id] = chat_title
-        logging.info("Bot added to chat: %s (%s)", chat_title, chat_id)
+        db_save_channels()
         for admin_id in config.ADMIN_IDS:
             try:
                 await bot.send_message(
@@ -266,7 +337,6 @@ async def on_new_member(event: ChatMemberUpdated):
 
     full_name = user.full_name or str(user_id)
 
-    # CN/AR ник
     if has_cn_or_ar(full_name + (user.username or "")):
         stats["cn_ar"] += 1
         stats["total"] += 1
@@ -278,10 +348,9 @@ async def on_new_member(event: ChatMemberUpdated):
             await _notify_admins("🚫 <b>Кикнут:</b> {} (<code>{}</code>)\n<b>Причина:</b> cn/ar ник\n<b>Чат:</b> {}".format(
                 full_name, user_id, chat_title))
         except Exception as e:
-            logging.warning("Failed to kick %s: %s", user_id, e)
+            logging.warning("kick cn/ar failed %s: %s", user_id, e)
         return
 
-    # Flood join
     is_flood, to_kick = track_flood_join(chat_id, user_id, full_name)
     if is_flood:
         kicked_names = []
@@ -299,19 +368,15 @@ async def on_new_member(event: ChatMemberUpdated):
                 stats["total"] += 1
                 _kick_log(uid, name, chat_id, chat_title, "flood join")
                 kicked_names.append("{} (<code>{}</code>)".format(name, uid))
-                logging.info("Flood kick: %s (%s) from %s", name, uid, chat_id)
             except Exception as e:
-                logging.warning("Flood kick failed for %s: %s", uid, e)
+                logging.warning("flood kick failed %s: %s", uid, e)
         db_save_stats()
         if kicked_names:
             await _notify_admins(
-                "🌊 <b>Флуд-кик:</b> кикнуто {} чел.\n{}\n<b>Чат:</b> {}".format(
-                    len(kicked_names), "\n".join(kicked_names), chat_title
-                )
-            )
+                "🌊 <b>Флуд-кик:</b> {} чел.\n{}\n<b>Чат:</b> {}".format(
+                    len(kicked_names), "\n".join(kicked_names), chat_title))
         return
 
-    # Не флуд — математическая капча
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
@@ -319,32 +384,26 @@ async def on_new_member(event: ChatMemberUpdated):
             until_date=int(time.time()) + CAPTCHA_TIMEOUT + 5
         )
     except Exception as e:
-        logging.warning("Failed to restrict %s: %s", user_id, e)
+        logging.warning("restrict failed %s: %s", user_id, e)
 
     await _send_math_captcha(chat_id, user_id, full_name, reply_to=None)
 
 
 async def _send_math_captcha(chat_id, user_id, full_name, reply_to=None):
-    """Send math captcha. reply_to = message_id to reply to, or None."""
     question, answer, wrongs = gen_math_captcha()
     keyboard = make_captcha_keyboard(chat_id, user_id, answer, wrongs)
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
     text = (
         "🧠 {}, добро пожаловать!\n\n"
-        "Чтобы подтвердить, что вы не бот, решите пример за <b>{} сек</b>:\n\n"
+        "Реши при��ер за <b>{} сек</b>, чтобы подтвердить, что вы не бот:\n\n"
         "<b>{} = ?</b>\n\n"
         "Выберите правильный ответ:"
     ).format(mention, CAPTCHA_TIMEOUT, question)
     try:
+        kwargs = dict(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard)
         if reply_to:
-            captcha_msg = await bot.send_message(
-                chat_id, text, parse_mode="HTML", reply_markup=keyboard,
-                reply_to_message_id=reply_to
-            )
-        else:
-            captcha_msg = await bot.send_message(
-                chat_id, text, parse_mode="HTML", reply_markup=keyboard
-            )
+            kwargs["reply_to_message_id"] = reply_to
+        captcha_msg = await bot.send_message(**kwargs)
         captcha_pending[(chat_id, user_id)] = {
             "msg_id": captcha_msg.message_id,
             "expire": time.time() + CAPTCHA_TIMEOUT,
@@ -352,7 +411,7 @@ async def _send_math_captcha(chat_id, user_id, full_name, reply_to=None):
         }
         asyncio.create_task(_captcha_timeout(chat_id, user_id, full_name, captcha_msg.message_id))
     except Exception as e:
-        logging.warning("Failed to send math captcha for %s: %s", user_id, e)
+        logging.warning("send captcha failed %s: %s", user_id, e)
 
 
 async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
@@ -371,11 +430,10 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
         await bot.ban_chat_member(chat_id, user_id)
         await bot.unban_chat_member(chat_id, user_id)
         _kick_log(user_id, full_name, chat_id, connected_channels.get(chat_id, str(chat_id)), "капча timeout")
-        logging.info("Kicked %s (%s): captcha timeout", full_name, user_id)
-        await _notify_admins("⏰ <b>Кикнут по таймауту капчи:</b> {} (<code>{}</code>)\n<b>Чат:</b> {}".format(
+        await _notify_admins("⏰ <b>Кикнут по таймауту:</b> {} (<code>{}</code>)\n<b>Чат:</b> {}".format(
             full_name, user_id, chat_id))
     except Exception as e:
-        logging.warning("Captcha timeout kick failed for %s: %s", user_id, e)
+        logging.warning("timeout kick failed %s: %s", user_id, e)
 
 
 # ─────────────────────────────────────────────
@@ -384,7 +442,6 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
 @dp.callback_query(F.data.startswith("mathcap_"))
 async def cb_math_captcha(call: CallbackQuery):
     parts = call.data.split("_")
-    # mathcap_{chat_id}_{user_id}_{chosen}
     chat_id = int(parts[1])
     user_id = int(parts[2])
     chosen = int(parts[3])
@@ -399,20 +456,16 @@ async def cb_math_captcha(call: CallbackQuery):
         return
 
     correct = pending["answer"]
+    full_name = call.from_user.full_name
 
     if chosen != correct:
-        # Неверный ответ — кикаем
         captcha_pending.pop((chat_id, user_id), None)
         stats["captcha_fail"] += 1
         stats["total"] += 1
         db_save_stats()
-        full_name = call.from_user.full_name
         _kick_log(user_id, full_name, chat_id, connected_channels.get(chat_id, str(chat_id)), "капча wrong answer")
         try:
-            await call.message.edit_text(
-                "❌ {} ошибся — исключён.".format(full_name),
-                parse_mode="HTML"
-            )
+            await call.message.edit_text("❌ {} ошибся — исключён.".format(full_name), parse_mode="HTML")
             asyncio.create_task(_delete_message_after(call.message.chat.id, call.message.message_id, 5))
         except Exception:
             pass
@@ -420,14 +473,12 @@ async def cb_math_captcha(call: CallbackQuery):
             await bot.ban_chat_member(chat_id, user_id)
             await bot.unban_chat_member(chat_id, user_id)
         except Exception as e:
-            logging.warning("Failed to kick after wrong captcha %s: %s", user_id, e)
+            logging.warning("kick after wrong captcha %s: %s", user_id, e)
         await call.answer("❌ Неверный ответ!", show_alert=True)
         return
 
-    # Верный ответ
     captcha_pending.pop((chat_id, user_id), None)
     db_add_verified(chat_id, user_id)
-
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
@@ -439,21 +490,17 @@ async def cb_math_captcha(call: CallbackQuery):
             )
         )
     except Exception as e:
-        logging.warning("Failed to unrestrict %s: %s", user_id, e)
+        logging.warning("unrestrict failed %s: %s", user_id, e)
 
-    mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, call.from_user.full_name)
+    mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
     try:
         await call.message.edit_text(
-            "✅ {} успешно прошёл проверку и может писать в чате!".format(mention),
-            parse_mode="HTML"
-        )
+            "✅ {} прошёл проверку и может писать!".format(mention), parse_mode="HTML")
         asyncio.create_task(
-            _delete_message_after(call.message.chat.id, call.message.message_id, CAPTCHA_SUCCESS_DELETE_AFTER)
-        )
+            _delete_message_after(call.message.chat.id, call.message.message_id, CAPTCHA_SUCCESS_DELETE_AFTER))
     except Exception:
         pass
     await call.answer("✅ Правильно! Добро пожаловать.")
-    logging.info("Math captcha passed by %s (%s) in chat %s", call.from_user.full_name, user_id, chat_id)
 
 
 # ─────────────────────────────────────────────
@@ -461,7 +508,6 @@ async def cb_math_captcha(call: CallbackQuery):
 # ─────────────────────────────────────────────
 @dp.message(F.chat.type.in_({"group", "supergroup"}) & F.content_type.in_(SERVICE_CONTENT_TYPES))
 async def auto_delete_service(msg: Message):
-    """Auto-delete service messages (join/leave/pin etc.) to keep chat clean."""
     try:
         await msg.delete()
     except Exception:
@@ -489,7 +535,7 @@ async def moderate_message(msg: Message):
 
     key = (chat_id, user_id)
 
-    # --- Неверифицирован ---
+    # Не верифицирован
     if key not in verified_users:
         if key in captcha_pending:
             try:
@@ -499,8 +545,6 @@ async def moderate_message(msg: Message):
             except Exception:
                 pass
             return
-
-        # Сначала отправляем капчу реплаем, потом удаляем сообщение
         await _send_math_captcha(chat_id, user_id, full_name, reply_to=msg.message_id)
         try:
             await msg.delete()
@@ -510,7 +554,6 @@ async def moderate_message(msg: Message):
             pass
         return
 
-    # --- Верифицирован ---
     text = msg.text or msg.caption or ""
 
     # CN/AR текст
@@ -524,6 +567,19 @@ async def moderate_message(msg: Message):
             pass
         return
 
+    # Мат
+    if text and has_swear(text):
+        stats["swear"] += 1
+        stats["msg_deleted"] += 1
+        db_save_stats()
+        try:
+            await msg.delete()
+            warn = await bot.send_message(chat_id, SWEAR_REPLY)
+            asyncio.create_task(_delete_message_after(chat_id, warn.message_id, 10))
+        except Exception:
+            pass
+        return
+
     # Copy-paste flood
     if text and check_copypaste(chat_id, user_id, text):
         stats["copypaste"] += 1
@@ -533,7 +589,6 @@ async def moderate_message(msg: Message):
             await msg.delete()
         except Exception:
             pass
-        # Мют на 60 сек
         try:
             await bot.restrict_chat_member(
                 chat_id, user_id,
@@ -546,10 +601,9 @@ async def moderate_message(msg: Message):
                 parse_mode="HTML"
             )
             asyncio.create_task(_delete_message_after(chat_id, warn_msg.message_id, 15))
-            # сбрасываем трекер
             copypaste_tracker.pop(key, None)
         except Exception as e:
-            logging.warning("Copypaste mute failed for %s: %s", user_id, e)
+            logging.warning("copypaste mute failed %s: %s", user_id, e)
 
 
 # ─────────────────────────────────────────────
@@ -567,25 +621,155 @@ def admin_private(msg: Message):
 
 
 # ─────────────────────────────────────────────
+# /panel — INLINE CONTROL PANEL
+# ─────────────────────────────────────────────
+def _panel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="panel_stats"),
+         InlineKeyboardButton(text="⚙️ Настройки", callback_data="panel_settings")],
+        [InlineKeyboardButton(text="📜 Лог киков (10)", callback_data="panel_kicklog"),
+         InlineKeyboardButton(text="🏆 Топ нарушителей", callback_data="panel_top")],
+        [InlineKeyboardButton(text="📬 Каналы", callback_data="panel_channels"),
+         InlineKeyboardButton(text="📋 Whitelist", callback_data="panel_whitelist")],
+        [InlineKeyboardButton(text="🤬 Слова-фильтры", callback_data="panel_swear"),
+         InlineKeyboardButton(text="✅ Статус", callback_data="panel_status")],
+    ])
+
+@dp.message(Command("panel"))
+async def cmd_panel(msg: Message):
+    if not admin_private(msg):
+        return
+    await msg.answer(
+        "🛡 <b>Панель управления</b>\n\nВыберите раздел:",
+        parse_mode="HTML",
+        reply_markup=_panel_keyboard()
+    )
+
+@dp.callback_query(F.data.startswith("panel_"))
+async def cb_panel(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    action = call.data[len("panel_"):]
+    await call.answer()
+
+    if action == "status":
+        await call.message.answer("✅ <b>Бот работает.</b> Polling активен.", parse_mode="HTML")
+
+    elif action == "stats":
+        d = db_read()
+        s = d.get("stats", stats)
+        await call.message.answer(
+            "📊 <b>Статистика (накопительная)</b>\n\n"
+            "🇨🇳 cn/ar ник: <b>{}</b>\n"
+            "🌊 Flood: <b>{}</b>\n"
+            "⏰ Капча провалена: <b>{}</b>\n"
+            "📋 Copypaste: <b>{}</b>\n"
+            "🤬 Мат: <b>{}</b>\n"
+            "🗑 Удалено сообщений: <b>{}</b>\n"
+            "──────────────\n"
+            "🚫 Всего кикнуто: <b>{}</b>\n"
+            "👥 Верифицировано: <b>{}</b>".format(
+                s.get("cn_ar", 0), s.get("flood", 0), s.get("captcha_fail", 0),
+                s.get("copypaste", 0), s.get("swear", 0), s.get("msg_deleted", 0),
+                s.get("total", 0), len(verified_users)
+            ), parse_mode="HTML")
+
+    elif action == "settings":
+        wl = len(whitelist)
+        await call.message.answer(
+            "⚙️ <b>Текущие настройки</b>\n\n"
+            "Flood-порог: <b>{} чел. за {} сек.</b>\n"
+            "Таймаут капчи: <b>{} сек.</b>\n"
+            "Copypaste лимит: <b>{} подряд</b>\n"
+            "Whitelist: <b>{} чел.</b>\n"
+            "Верифицировано: <b>{}</b>\n"
+            "Слов в фильтре: <b>{}</b>\n\n"
+            "<i>Для изменения используй команды:\n"
+            "/setflood /setcaptcha /setcopypaste</i>".format(
+                flood_threshold, flood_window, CAPTCHA_TIMEOUT,
+                COPYPASTE_LIMIT, wl, len(verified_users), len(swear_words)
+            ), parse_mode="HTML")
+
+    elif action == "kicklog":
+        d = db_read()
+        log = d.get("kick_log", [])
+        if not log:
+            await call.message.answer("📜 Лог киков пуст.")
+            return
+        recent = list(reversed(log[-10:]))
+        lines = ["📜 <b>Последние 10 киков:</b>\n"]
+        for e in recent:
+            lines.append("• <b>{}</b> — <i>{}</i> [{}]".format(
+                e.get("name", "?"), e.get("reason", "?"), e.get("ts", "?")))
+        await call.message.answer("\n".join(lines), parse_mode="HTML")
+
+    elif action == "top":
+        d = db_read()
+        log = d.get("kick_log", [])
+        if not log:
+            await call.message.answer("🏆 Нарушителей пока нет.")
+            return
+        counts = {}
+        names = {}
+        for e in log:
+            uid = e.get("user_id")
+            if uid:
+                counts[uid] = counts.get(uid, 0) + 1
+                names[uid] = e.get("name", str(uid))
+        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        lines = ["🏆 <b>Топ нарушителей:</b>\n"]
+        for i, (uid, cnt) in enumerate(top, 1):
+            lines.append("{}. {} — {} раз".format(i, names[uid], cnt))
+        await call.message.answer("\n".join(lines), parse_mode="HTML")
+
+    elif action == "channels":
+        if not connected_channels:
+            await call.message.answer("📭 Нет подключённых чатов.")
+            return
+        lines = ["📬 <b>Подключённые чаты:</b>\n"]
+        for cid, title in connected_channels.items():
+            lines.append("• {} — <code>{}</code>".format(title, cid))
+        await call.message.answer("\n".join(lines), parse_mode="HTML")
+
+    elif action == "whitelist":
+        if not whitelist:
+            await call.message.answer("📋 Whitelist пуст.")
+            return
+        wl_str = "\n".join("• <code>{}</code>".format(u) for u in whitelist)
+        await call.message.answer("📋 <b>Whitelist:</b>\n" + wl_str, parse_mode="HTML")
+
+    elif action == "swear":
+        words_str = ", ".join(sorted(swear_words)[:30])
+        more = " и ещё {}...".format(len(swear_words) - 30) if len(swear_words) > 30 else ""
+        await call.message.answer(
+            "🤬 <b>Фильтр мата</b> ({} слов):\n\n<code>{}{}</code>\n\n"
+            "<i>Добавить: /addswear слово\nУдалить: /removeswear слово</i>".format(
+                len(swear_words), words_str, more),
+            parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────
 # ADMIN COMMANDS
 # ─────────────────────────────────────────────
 MENU_TEXT = (
     "🛡 <b>Антиспам-бот — Панель управления</b>\n\n"
+    "/panel — интерактивная панель (рекомендуется)\n"
     "/status — статус бота\n"
-    "/stats — статистика (персистентная)\n"
-    "/kicklog [N] — последние N киков (по умолчанию 10)\n"
-    "/topviolators [N] — топ N нарушителей\n"
-    "/channels — подключённые каналы/группы\n"
-    "/addchannel [chat_id] — подключить вручную\n"
+    "/stats — статистика\n"
+    "/kicklog [N] — последние N киков\n"
+    "/topviolators [N] — топ нарушителей\n"
+    "/channels — подключённые чаты\n"
+    "/addchannel [chat_id] — подключить\n"
     "/removechannel [chat_id] — отключить\n"
     "/memberstats [chat_id] — статистика участников\n"
-    "/setflood [кол-во] [секунд] — порог flood\n"
-    "  пример: <code>/setflood 3 5</code>\n"
-    "/setcaptcha [секунд] — таймаут капчи (сейчас: {})\n"
-    "/setcopypaste [N] — лимит одинаковых сообщений (сейчас: {})\n"
-    "/whitelist add [user_id] — добавить в белый список\n"
-    "/whitelist remove [user_id] — убрать\n"
-    "/whitelist list — показать белый список\n"
+    "/setflood [кол-во] [сек] — порог flood\n"
+    "/setcaptcha [сек] — таймаут капчи\n"
+    "/setcopypaste [N] — лимит copypaste\n"
+    "/addswear [слово] — добавить в фильтр мата\n"
+    "/removeswear [слово] — убрать из фильтра\n"
+    "/listswear — список матных слов\n"
+    "/whitelist add/remove/list [user_id]\n"
     "/settings — текущие настройки\n"
     "/help — это меню"
 )
@@ -594,19 +778,19 @@ MENU_TEXT = (
 async def cmd_start(msg: Message):
     if not admin_private(msg):
         return
-    await msg.answer(MENU_TEXT.format(CAPTCHA_TIMEOUT, COPYPASTE_LIMIT), parse_mode="HTML")
+    await msg.answer(MENU_TEXT, parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(msg: Message):
     if not admin_private(msg):
         return
-    await msg.answer(MENU_TEXT.format(CAPTCHA_TIMEOUT, COPYPASTE_LIMIT), parse_mode="HTML")
+    await msg.answer(MENU_TEXT, parse_mode="HTML")
 
 @dp.message(Command("status"))
 async def cmd_status(msg: Message):
     if not admin_private(msg):
         return
-    await msg.answer("✅ <b>Бот работает</b>\nPolling активен.", parse_mode="HTML")
+    await msg.answer("✅ <b>Бот работает.</b> Polling активен.", parse_mode="HTML")
 
 @dp.message(Command("stats"))
 async def cmd_stats(msg: Message):
@@ -617,47 +801,38 @@ async def cmd_stats(msg: Message):
     await msg.answer(
         "📊 <b>Статистика (накопительная)</b>\n\n"
         "🇨🇳 cn/ar ник: <b>{}</b>\n"
-        "🌊 Flood-вступление: <b>{}</b>\n"
-        "⏰ Не прошли капчу: <b>{}</b>\n"
-        "📋 Copy-paste спам: <b>{}</b>\n"
+        "🌊 Flood: <b>{}</b>\n"
+        "⏰ Капча провалена: <b>{}</b>\n"
+        "📋 Copypaste: <b>{}</b>\n"
+        "🤬 Мат: <b>{}</b>\n"
         "🗑 Удалено сообщений: <b>{}</b>\n"
         "──────────────\n"
         "🚫 Всего кикнуто: <b>{}</b>\n"
-        "👥 Верифицировано в БД: <b>{}</b>".format(
+        "👥 Верифицировано: <b>{}</b>".format(
             s.get("cn_ar", 0), s.get("flood", 0), s.get("captcha_fail", 0),
-            s.get("copypaste", 0), s.get("msg_deleted", 0),
+            s.get("copypaste", 0), s.get("swear", 0), s.get("msg_deleted", 0),
             s.get("total", 0), len(verified_users)
-        ),
-        parse_mode="HTML"
-    )
+        ), parse_mode="HTML")
 
 @dp.message(Command("kicklog"))
 async def cmd_kicklog(msg: Message):
     if not admin_private(msg):
         return
     parts = msg.text.split()
-    n = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10
-    n = min(n, 50)
+    n = min(int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10, 50)
     d = db_read()
     log = d.get("kick_log", [])
     if not log:
-        await msg.answer("📜 Лог киков пуст.", parse_mode="HTML")
+        await msg.answer("📜 Лог киков пуст.")
         return
-    recent = log[-n:]
-    recent.reverse()
+    recent = list(reversed(log[-n:]))
     lines = ["📜 <b>Последние {} киков:</b>\n".format(len(recent))]
     for e in recent:
         lines.append(
             "• <b>{}</b> (<code>{}</code>)\n"
-            "  Причина: <i>{}</i>\n"
-            "  Чат: {}\n"
-            "  Время: {}".format(
+            "  Причина: <i>{}</i> | Чат: {} | {}".format(
                 e.get("name", "?"), e.get("user_id", "?"),
-                e.get("reason", "?"),
-                e.get("chat_title", "?"),
-                e.get("ts", "?")
-            )
-        )
+                e.get("reason", "?"), e.get("chat_title", "?"), e.get("ts", "?")))
     await msg.answer("\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("topviolators"))
@@ -665,15 +840,13 @@ async def cmd_topviolators(msg: Message):
     if not admin_private(msg):
         return
     parts = msg.text.split()
-    n = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10
-    n = min(n, 30)
+    n = min(int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10, 30)
     d = db_read()
     log = d.get("kick_log", [])
     if not log:
-        await msg.answer("🏆 Нарушителей пока нет.", parse_mode="HTML")
+        await msg.answer("🏆 Нарушителей пока нет.")
         return
-    counts = {}
-    names = {}
+    counts, names = {}, {}
     for e in log:
         uid = e.get("user_id")
         if uid:
@@ -682,34 +855,8 @@ async def cmd_topviolators(msg: Message):
     top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:n]
     lines = ["🏆 <b>Топ нарушителей:</b>\n"]
     for i, (uid, cnt) in enumerate(top, 1):
-        lines.append("{}. <b>{}</b> (<code>{}</code>) — {} раз()".format(
-            i, names[uid], uid, cnt
-        ))
+        lines.append("{}. <b>{}</b> (<code>{}</code>) — {} раз".format(i, names[uid], uid, cnt))
     await msg.answer("\n".join(lines), parse_mode="HTML")
-
-@dp.message(Command("setcaptcha"))
-async def cmd_setcaptcha(msg: Message):
-    global CAPTCHA_TIMEOUT
-    if not admin_private(msg):
-        return
-    parts = msg.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await msg.answer("Использование: <code>/setcaptcha [секунд]</code>", parse_mode="HTML")
-        return
-    CAPTCHA_TIMEOUT = int(parts[1])
-    await msg.answer("✅ Таймаут капчи: <b>{} сек.</b>".format(CAPTCHA_TIMEOUT), parse_mode="HTML")
-
-@dp.message(Command("setcopypaste"))
-async def cmd_setcopypaste(msg: Message):
-    global COPYPASTE_LIMIT
-    if not admin_private(msg):
-        return
-    parts = msg.text.split()
-    if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) < 2:
-        await msg.answer("Использование: <code>/setcopypaste [N]</code> (минимум 2)", parse_mode="HTML")
-        return
-    COPYPASTE_LIMIT = int(parts[1])
-    await msg.answer("✅ Лимит copy-paste: <b>{}</b> одинаковых сообщений подряд.".format(COPYPASTE_LIMIT), parse_mode="HTML")
 
 @dp.message(Command("setflood"))
 async def cmd_setflood(msg: Message):
@@ -722,26 +869,94 @@ async def cmd_setflood(msg: Message):
         return
     flood_threshold = int(parts[1])
     flood_window = int(parts[2])
+    db_save_settings()
     await msg.answer("✅ Flood-порог: <b>{} чел. за {} сек.</b>".format(flood_threshold, flood_window), parse_mode="HTML")
+
+@dp.message(Command("setcaptcha"))
+async def cmd_setcaptcha(msg: Message):
+    global CAPTCHA_TIMEOUT
+    if not admin_private(msg):
+        return
+    parts = msg.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await msg.answer("Использование: <code>/setcaptcha [секунд]</code>", parse_mode="HTML")
+        return
+    CAPTCHA_TIMEOUT = int(parts[1])
+    db_save_settings()
+    await msg.answer("✅ Таймаут капчи: <b>{} сек.</b>".format(CAPTCHA_TIMEOUT), parse_mode="HTML")
+
+@dp.message(Command("setcopypaste"))
+async def cmd_setcopypaste(msg: Message):
+    global COPYPASTE_LIMIT
+    if not admin_private(msg):
+        return
+    parts = msg.text.split()
+    if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) < 2:
+        await msg.answer("Использование: <code>/setcopypaste [N]</code> (мин. 2)", parse_mode="HTML")
+        return
+    COPYPASTE_LIMIT = int(parts[1])
+    db_save_settings()
+    await msg.answer("✅ Лимит copypaste: <b>{}</b> подряд.".format(COPYPASTE_LIMIT), parse_mode="HTML")
 
 @dp.message(Command("settings"))
 async def cmd_settings(msg: Message):
     if not admin_private(msg):
         return
-    wl = ", ".join(str(u) for u in whitelist) if whitelist else "пусто"
     await msg.answer(
         "⚙️ <b>Текущие настройки</b>\n\n"
         "Flood-порог: <b>{} чел. за {} сек.</b>\n"
         "Таймаут капчи: <b>{} сек.</b>\n"
-        "Copy-paste лимит: <b>{} подряд</b>\n"
-        "Белый список: <b>{}</b>\n"
-        "Верифицировано в БД: <b>{}</b>".format(
+        "Copypaste лимит: <b>{} подряд</b>\n"
+        "Whitelist: <b>{} чел.</b>\n"
+        "Верифицировано: <b>{}</b>\n"
+        "Слов в фильтре мата: <b>{}</b>".format(
             flood_threshold, flood_window, CAPTCHA_TIMEOUT,
-            COPYPASTE_LIMIT, wl, len(verified_users)
-        ),
-        parse_mode="HTML"
-    )
+            COPYPASTE_LIMIT, len(whitelist), len(verified_users), len(swear_words)
+        ), parse_mode="HTML")
 
+# --- Swear commands ---
+@dp.message(Command("addswear"))
+async def cmd_addswear(msg: Message):
+    global swear_re
+    if not admin_private(msg):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("Использование: <code>/addswear слово</code>", parse_mode="HTML")
+        return
+    word = parts[1].strip().lower()
+    swear_words.add(word)
+    swear_re = _build_swear_re(swear_words)
+    db_save_swear_words()
+    await msg.answer("✅ Слово <code>{}</code> добавлено в фильтр.".format(word), parse_mode="HTML")
+
+@dp.message(Command("removeswear"))
+async def cmd_removeswear(msg: Message):
+    global swear_re
+    if not admin_private(msg):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("Использование: <code>/removeswear слово</code>", parse_mode="HTML")
+        return
+    word = parts[1].strip().lower()
+    swear_words.discard(word)
+    swear_re = _build_swear_re(swear_words)
+    db_save_swear_words()
+    await msg.answer("✅ Слово <code>{}</code> удалено из фильтра.".format(word), parse_mode="HTML")
+
+@dp.message(Command("listswear"))
+async def cmd_listswear(msg: Message):
+    if not admin_private(msg):
+        return
+    if not swear_words:
+        await msg.answer("🤬 Фильтр мата пуст.")
+        return
+    words_str = ", ".join(sorted(swear_words))
+    await msg.answer("🤬 <b>Фильтр мата ({} слов):</b>\n<code>{}</code>".format(
+        len(swear_words), words_str), parse_mode="HTML")
+
+# --- Whitelist ---
 @dp.message(Command("whitelist"))
 async def cmd_whitelist(msg: Message):
     if not admin_private(msg):
@@ -753,23 +968,23 @@ async def cmd_whitelist(msg: Message):
             "<code>/whitelist add [user_id]</code>\n"
             "<code>/whitelist remove [user_id]</code>\n"
             "<code>/whitelist list</code>",
-            parse_mode="HTML"
-        )
+            parse_mode="HTML")
         return
     action = parts[1].lower()
     if action == "list":
         wl = ", ".join(str(u) for u in whitelist) if whitelist else "пусто"
-        await msg.answer("📋 Белый список: <b>{}</b>".format(wl), parse_mode="HTML")
+        await msg.answer("📋 Whitelist: <b>{}</b>".format(wl), parse_mode="HTML")
     elif action in ("add", "remove") and len(parts) == 3 and parts[2].lstrip("-").isdigit():
         uid = int(parts[2])
         if action == "add":
             whitelist.add(uid)
-            await msg.answer("✅ <code>{}</code> добавлен в белый список.".format(uid), parse_mode="HTML")
+            await msg.answer("✅ <code>{}</code> добавлен в whitelist.".format(uid), parse_mode="HTML")
         else:
             whitelist.discard(uid)
-            await msg.answer("✅ <code>{}</code> удалён из белого списка.".format(uid), parse_mode="HTML")
+            await msg.answer("✅ <code>{}</code> удалён из whitelist.".format(uid), parse_mode="HTML")
+        db_save_whitelist()
     else:
-        await msg.answer("Неверный ф��рмат. Напиши /help", parse_mode="HTML")
+        await msg.answer("Неверный формат. Напиши /help")
 
 # --- Channel management ---
 @dp.message(Command("channels"))
@@ -778,13 +993,11 @@ async def cmd_channels(msg: Message):
         return
     if not connected_channels:
         await msg.answer(
-            "📭 <b>Подключённые каналы/группы</b>\n\nПока нет подключённых чатов.\n\n"
-            "Добавьте бота как администратора — он зарегистрируется автоматически.\n"
-            "Или: <code>/addchannel [chat_id]</code>",
-            parse_mode="HTML"
-        )
+            "📭 <b>Нет подключённых чатов.</b>\n\n"
+            "Добавьте бота как администратора или: <code>/addchannel [chat_id]</code>",
+            parse_mode="HTML")
         return
-    lines = ["📬 <b>Подключённые каналы/группы</b>\n"]
+    lines = ["📬 <b>Подключённые чаты:</b>\n"]
     keyboard_buttons = []
     for i, (cid, title) in enumerate(connected_channels.items(), 1):
         lines.append("{}. {} — <code>{}</code>".format(i, title, cid))
@@ -807,6 +1020,7 @@ async def cmd_addchannel(msg: Message):
     try:
         chat = await bot.get_chat(cid)
         connected_channels[cid] = chat.title or str(cid)
+        db_save_channels()
         await msg.answer("✅ Подключён: <b>{}</b> (<code>{}</code>)".format(chat.title or "—", cid), parse_mode="HTML")
     except Exception as e:
         await msg.answer("❌ Ошибка: <code>{}</code>".format(e), parse_mode="HTML")
@@ -822,9 +1036,10 @@ async def cmd_removechannel(msg: Message):
     cid = int(parts[1])
     if cid in connected_channels:
         title = connected_channels.pop(cid)
+        db_save_channels()
         await msg.answer("✅ Канал <b>{}</b> отключён.".format(title), parse_mode="HTML")
     else:
-        await msg.answer("❌ Канал <code>{}</code> не найден.".format(cid), parse_mode="HTML")
+        await msg.answer("❌ Канал не найден.", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("removechan_"))
 async def cb_removechan(call: CallbackQuery):
@@ -834,9 +1049,10 @@ async def cb_removechan(call: CallbackQuery):
     cid = int(call.data.split("_", 1)[1])
     if cid in connected_channels:
         title = connected_channels.pop(cid)
+        db_save_channels()
         await call.answer("Канал «{}» отключён.".format(title), show_alert=True)
         await call.message.edit_reply_markup(reply_markup=None)
-        await call.message.answer("✅ Канал <b>{}</b> (<code>{}</code>) отключён.".format(title, cid), parse_mode="HTML")
+        await call.message.answer("✅ Канал <b>{}</b> отключён.".format(title), parse_mode="HTML")
     else:
         await call.answer("Уже отключён.", show_alert=True)
 
@@ -850,7 +1066,7 @@ async def cmd_memberstats(msg: Message):
         if len(connected_channels) == 1:
             cid = list(connected_channels.keys())[0]
         elif len(connected_channels) == 0:
-            await msg.answer("❌ Нет подключённых каналов.", parse_mode="HTML")
+            await msg.answer("❌ Нет подключённых каналов.")
             return
         else:
             buttons = [[InlineKeyboardButton(text=title[:40], callback_data="memberstats_{}".format(cid))]
@@ -872,7 +1088,7 @@ async def cb_memberstats(call: CallbackQuery):
 
 async def _send_memberstats(target_chat_id, source_chat_id):
     title = connected_channels.get(source_chat_id, str(source_chat_id))
-    await bot.send_message(target_chat_id, "⏳ Собиႈаю статистику для <b>{}</b>...".format(title), parse_mode="HTML")
+    await bot.send_message(target_chat_id, "⏳ Собираю статистику для <b>{}</b>...".format(title), parse_mode="HTML")
     try:
         count = await bot.get_chat_member_count(source_chat_id)
         admins = await bot.get_chat_administrators(source_chat_id)
@@ -884,14 +1100,13 @@ async def _send_memberstats(target_chat_id, source_chat_id):
     await bot.send_message(
         target_chat_id,
         "📊 <b>Статистика участников</b>\n"
-        "📬 Канал: <b>{}</b> (<code>{}</code>)\n\n"
+        "📬 Чат: <b>{}</b> (<code>{}</code>)\n\n"
         "👥 Всего: <b>{}</b>\n"
         "👑 Администраторов: <b>{}</b>\n"
         "🤖 Ботов (из адм.): <b>{}</b>\n"
         "⭐ Premium (из адм.): <b>{}</b>".format(
             title, source_chat_id, count, len(admins), bots, premium),
-        parse_mode="HTML"
-    )
+        parse_mode="HTML")
 
 
 async def main():
