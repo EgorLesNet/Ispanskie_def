@@ -3,8 +3,10 @@ import re
 import time
 import json
 import os
+import random
 import logging
 from collections import deque
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     ChatMemberUpdated, Message, InlineKeyboardMarkup,
@@ -32,45 +34,83 @@ def has_cn_or_ar(text):
 # ─────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db.json")
 
-def db_load() -> set:
+DEFAULT_DB = {
+    "verified_users": [],
+    "stats": {"cn_ar": 0, "flood": 0, "total": 0, "captcha_fail": 0, "msg_deleted": 0, "copypaste": 0},
+    "kick_log": []
+}
+
+def db_read() -> dict:
     if not os.path.exists(DB_PATH):
-        return set()
+        return {k: v for k, v in DEFAULT_DB.items()}
     try:
         with open(DB_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return set(tuple(pair) for pair in data.get("verified_users", []))
+        # Дополняем отсутствующие поля если старый db.json
+        for k, v in DEFAULT_DB.items():
+            if k not in data:
+                data[k] = v
+        if "copypaste" not in data.get("stats", {}):
+            data["stats"]["copypaste"] = 0
+        return data
     except Exception as e:
-        logging.warning("db_load error: %s", e)
-        return set()
+        logging.warning("db_read error: %s", e)
+        return {k: v for k, v in DEFAULT_DB.items()}
 
-def db_save(verified: set):
+def db_write(data: dict):
     try:
         with open(DB_PATH, "w", encoding="utf-8") as f:
-            json.dump({"verified_users": [list(pair) for pair in verified]}, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.warning("db_save error: %s", e)
+        logging.warning("db_write error: %s", e)
 
-def db_add(chat_id: int, user_id: int):
+def db_add_verified(chat_id: int, user_id: int):
     verified_users.add((chat_id, user_id))
-    db_save(verified_users)
+    d = db_read()
+    d["verified_users"] = [list(p) for p in verified_users]
+    db_write(d)
+
+def db_save_stats():
+    d = db_read()
+    d["stats"] = stats
+    db_write(d)
+
+def db_add_kick_log(entry: dict):
+    """entry: {user_id, name, chat_id, chat_title, reason, ts}"""
+    d = db_read()
+    log = d.get("kick_log", [])
+    log.append(entry)
+    # Храним не более 1000 записей
+    if len(log) > 1000:
+        log = log[-1000:]
+    d["kick_log"] = log
+    db_write(d)
 
 # --- Runtime state ---
+_db_init = db_read()
+verified_users = set(tuple(pair) for pair in _db_init.get("verified_users", []))
+stats = _db_init.get("stats", dict(DEFAULT_DB["stats"]))
+
+logging.info("Loaded %d verified users from db.json", len(verified_users))
+logging.info("Loaded stats from db.json: %s", stats)
+
 # join_flood: {chat_id: deque of (timestamp, user_id, full_name)}
 join_flood = {}
 whitelist = set()
-stats = {"cn_ar": 0, "flood": 0, "total": 0, "captcha_fail": 0, "msg_deleted": 0}
 flood_threshold = config.FLOOD_THRESHOLD
 flood_window = config.FLOOD_WINDOW
 
 connected_channels = {}
-captcha_pending = {}
+captcha_pending = {}  # (chat_id, user_id) -> {msg_id, expire, answer}
 
-verified_users = db_load()
-logging.info("Loaded %d verified users from db.json", len(verified_users))
+# copy-paste flood: {(chat_id, user_id): deque of (timestamp, text_hash)}
+copypaste_tracker = {}
+COPYPASTE_LIMIT = 3      # сколько одинаковых сообщений подря��
 
 CAPTCHA_TIMEOUT = 120
 CAPTCHA_SUCCESS_DELETE_AFTER = 20
 
+# Сервисные типы для автоудаления
 SERVICE_CONTENT_TYPES = {
     ContentType.NEW_CHAT_MEMBERS,
     ContentType.LEFT_CHAT_MEMBER,
@@ -87,32 +127,93 @@ SERVICE_CONTENT_TYPES = {
 def is_admin(user_id):
     return user_id in config.ADMIN_IDS
 
+# ─────────────────────────────────────────────
+# MATH CAPTCHA
+# ─────────────────────────────────────────────
+def gen_math_captcha():
+    """Generate a simple math question and return (question_str, correct_answer, wrong_answers_list)"""
+    a = random.randint(1, 15)
+    b = random.randint(1, 15)
+    op = random.choice(["+", "-", "*"])
+    if op == "+":
+        answer = a + b
+        question = "{} + {}".format(a, b)
+    elif op == "-":
+        # чтобы не было отрицательных
+        if a < b:
+            a, b = b, a
+        answer = a - b
+        question = "{} - {}".format(a, b)
+    else:
+        a = random.randint(2, 9)
+        b = random.randint(2, 9)
+        answer = a * b
+        question = "{} × {}".format(a, b)
+
+    # 3 неправильных ответа
+    wrong = set()
+    while len(wrong) < 3:
+        delta = random.choice([-3, -2, -1, 1, 2, 3])
+        w = answer + delta
+        if w != answer and w >= 0:
+            wrong.add(w)
+    return question, answer, list(wrong)
+
+def make_captcha_keyboard(chat_id, user_id, correct, wrongs):
+    options = wrongs + [correct]
+    random.shuffle(options)
+    buttons = [
+        InlineKeyboardButton(
+            text=str(opt),
+            callback_data="mathcap_{}_{}_{}".format(chat_id, user_id, opt)
+        )
+        for opt in options
+    ]
+    # В 2 ряда по 2
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[:2], buttons[2:]])
+
+# ─────────────────────────────────────────────
+# COPY-PASTE FLOOD
+# ─────────────────────────────────────────────
+def check_copypaste(chat_id: int, user_id: int, text: str) -> bool:
+    """
+    Возвращает True, если пользователь превысил COPYPASTE_LIMIT одинаковых сообщений подряд.
+    """
+    if not text or len(text.strip()) < 5:
+        return False
+    key = (chat_id, user_id)
+    text_hash = hash(text.strip().lower())
+    now = time.time()
+    if key not in copypaste_tracker:
+        copypaste_tracker[key] = deque()
+    q = copypaste_tracker[key]
+    # убираем записи старше 60 сек
+    while q and now - q[0][0] > 60:
+        q.popleft()
+    # если последний хэш не совпадает — сбрасываем цепочку
+    if q and q[-1][1] != text_hash:
+        q.clear()
+    q.append((now, text_hash))
+    return len(q) >= COPYPASTE_LIMIT
+
+# ─────────────────────────────────────────────
+# FLOOD JOIN
+# ─────────────────────────────────────────────
 def track_flood_join(chat_id: int, user_id: int, full_name: str):
-    """
-    Добавляет запись о вступлении в окно флуда.
-    Возвращает (is_flood: bool, to_kick: list of (user_id, full_name)).
-    to_kick заполняется только при первом превышении порога (чтобы кикнуть всех сразу).
-    """
     now = time.time()
     if chat_id not in join_flood:
         join_flood[chat_id] = deque()
     q = join_flood[chat_id]
-
-    # Убираем устаревшие записи за пределами окна
     while q and now - q[0][0] > flood_window:
         q.popleft()
-
     was_flood = len(q) >= flood_threshold
     q.append((now, user_id, full_name))
     is_flood = len(q) >= flood_threshold
-
     if is_flood and not was_flood:
-        # Порог только что превышен — возвращаем всех в окне для кика
         to_kick = [(uid, name) for (_, uid, name) in q]
         q.clear()
         return True, to_kick
     elif is_flood:
-        # Флуд уже шёл — кикаем только текущего
         return True, [(user_id, full_name)]
     else:
         return False, []
@@ -124,6 +225,17 @@ async def _delete_message_after(chat_id: int, message_id: int, delay: int):
     except Exception:
         pass
 
+def _kick_log(user_id, name, chat_id, chat_title, reason):
+    entry = {
+        "user_id": user_id,
+        "name": name,
+        "chat_id": chat_id,
+        "chat_title": chat_title or str(chat_id),
+        "reason": reason,
+        "ts": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    db_add_kick_log(entry)
+
 # ─────────────────────────────────────────────
 # NEW MEMBER HANDLER
 # ─────────────────────────────────────────────
@@ -132,16 +244,16 @@ async def on_new_member(event: ChatMemberUpdated):
     user = event.new_chat_member.user
     chat_id = event.chat.id
     user_id = user.id
+    chat_title = event.chat.title or str(chat_id)
 
     if user_id == (await bot.get_me()).id:
-        connected_channels[chat_id] = event.chat.title or str(chat_id)
-        logging.info("Bot added to chat: %s (%s)", event.chat.title, chat_id)
+        connected_channels[chat_id] = chat_title
+        logging.info("Bot added to chat: %s (%s)", chat_title, chat_id)
         for admin_id in config.ADMIN_IDS:
             try:
                 await bot.send_message(
                     admin_id,
-                    "✅ <b>Бот подключён к чату:</b> {}\n<code>{}</code>".format(
-                        event.chat.title or "без названия", chat_id),
+                    "✅ <b>Бот подключён к чату:</b> {}\n<code>{}</code>".format(chat_title, chat_id),
                     parse_mode="HTML"
                 )
             except Exception:
@@ -149,25 +261,27 @@ async def on_new_member(event: ChatMemberUpdated):
         return
 
     if user_id in whitelist:
-        db_add(chat_id, user_id)
+        db_add_verified(chat_id, user_id)
         return
 
     full_name = user.full_name or str(user_id)
 
-    # Проверка CN/AR ника
+    # CN/AR ник
     if has_cn_or_ar(full_name + (user.username or "")):
         stats["cn_ar"] += 1
         stats["total"] += 1
+        db_save_stats()
         try:
             await bot.ban_chat_member(chat_id, user_id)
             await bot.unban_chat_member(chat_id, user_id)
+            _kick_log(user_id, full_name, chat_id, chat_title, "cn/ar ник")
             await _notify_admins("🚫 <b>Кикнут:</b> {} (<code>{}</code>)\n<b>Причина:</b> cn/ar ник\n<b>Чат:</b> {}".format(
-                full_name, user_id, event.chat.title or chat_id))
+                full_name, user_id, chat_title))
         except Exception as e:
             logging.warning("Failed to kick %s: %s", user_id, e)
         return
 
-    # Проверка flood
+    # Flood join
     is_flood, to_kick = track_flood_join(chat_id, user_id, full_name)
     if is_flood:
         kicked_names = []
@@ -175,7 +289,6 @@ async def on_new_member(event: ChatMemberUpdated):
             try:
                 await bot.ban_chat_member(chat_id, uid)
                 await bot.unban_chat_member(chat_id, uid)
-                # Снимаем капчу если была отправлена
                 pending = captcha_pending.pop((chat_id, uid), None)
                 if pending:
                     try:
@@ -184,22 +297,21 @@ async def on_new_member(event: ChatMemberUpdated):
                         pass
                 stats["flood"] += 1
                 stats["total"] += 1
+                _kick_log(uid, name, chat_id, chat_title, "flood join")
                 kicked_names.append("{} (<code>{}</code>)".format(name, uid))
                 logging.info("Flood kick: %s (%s) from %s", name, uid, chat_id)
             except Exception as e:
                 logging.warning("Flood kick failed for %s: %s", uid, e)
-
+        db_save_stats()
         if kicked_names:
             await _notify_admins(
                 "🌊 <b>Флуд-кик:</b> кикнуто {} чел.\n{}\n<b>Чат:</b> {}".format(
-                    len(kicked_names),
-                    "\n".join(kicked_names),
-                    event.chat.title or chat_id
+                    len(kicked_names), "\n".join(kicked_names), chat_title
                 )
             )
         return
 
-    # Не флуд — отправляем капчу
+    # Не флуд — математическая капча
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
@@ -209,29 +321,38 @@ async def on_new_member(event: ChatMemberUpdated):
     except Exception as e:
         logging.warning("Failed to restrict %s: %s", user_id, e)
 
+    await _send_math_captcha(chat_id, user_id, full_name, reply_to=None)
+
+
+async def _send_math_captcha(chat_id, user_id, full_name, reply_to=None):
+    """Send math captcha. reply_to = message_id to reply to, or None."""
+    question, answer, wrongs = gen_math_captcha()
+    keyboard = make_captcha_keyboard(chat_id, user_id, answer, wrongs)
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="✅ Я не бот — подтвердить",
-            callback_data="captcha_ok_{}_{}".format(chat_id, user_id)
-        )
-    ]])
+    text = (
+        "🧠 {}, добро пожаловать!\n\n"
+        "Чтобы подтвердить, что вы не бот, решите пример за <b>{} сек</b>:\n\n"
+        "<b>{} = ?</b>\n\n"
+        "Выберите правильный ответ:"
+    ).format(mention, CAPTCHA_TIMEOUT, question)
     try:
-        captcha_msg = await bot.send_message(
-            chat_id,
-            "👋 {}, добро пожаловать!\n\n"
-            "Пожалуйста, подтвердите, что вы не бот — нажмите кнопку в течение <b>{} секунд</b>.\n"
-            "Иначе вы будете исключены.".format(mention, CAPTCHA_TIMEOUT),
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+        if reply_to:
+            captcha_msg = await bot.send_message(
+                chat_id, text, parse_mode="HTML", reply_markup=keyboard,
+                reply_to_message_id=reply_to
+            )
+        else:
+            captcha_msg = await bot.send_message(
+                chat_id, text, parse_mode="HTML", reply_markup=keyboard
+            )
         captcha_pending[(chat_id, user_id)] = {
             "msg_id": captcha_msg.message_id,
-            "expire": time.time() + CAPTCHA_TIMEOUT
+            "expire": time.time() + CAPTCHA_TIMEOUT,
+            "answer": answer
         }
         asyncio.create_task(_captcha_timeout(chat_id, user_id, full_name, captcha_msg.message_id))
     except Exception as e:
-        logging.warning("Failed to send captcha for %s: %s", user_id, e)
+        logging.warning("Failed to send math captcha for %s: %s", user_id, e)
 
 
 async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
@@ -241,6 +362,7 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
     captcha_pending.pop((chat_id, user_id), None)
     stats["captcha_fail"] += 1
     stats["total"] += 1
+    db_save_stats()
     try:
         await bot.delete_message(chat_id, captcha_msg_id)
     except Exception:
@@ -248,6 +370,7 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
     try:
         await bot.ban_chat_member(chat_id, user_id)
         await bot.unban_chat_member(chat_id, user_id)
+        _kick_log(user_id, full_name, chat_id, connected_channels.get(chat_id, str(chat_id)), "капча timeout")
         logging.info("Kicked %s (%s): captcha timeout", full_name, user_id)
         await _notify_admins("⏰ <b>Кикнут по таймауту капчи:</b> {} (<code>{}</code>)\n<b>Чат:</b> {}".format(
             full_name, user_id, chat_id))
@@ -256,24 +379,54 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
 
 
 # ─────────────────────────────────────────────
-# CAPTCHA CALLBACK
+# MATH CAPTCHA CALLBACK
 # ─────────────────────────────────────────────
-@dp.callback_query(F.data.startswith("captcha_ok_"))
-async def cb_captcha_ok(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("mathcap_"))
+async def cb_math_captcha(call: CallbackQuery):
     parts = call.data.split("_")
-    chat_id = int(parts[2])
-    user_id = int(parts[3])
+    # mathcap_{chat_id}_{user_id}_{chosen}
+    chat_id = int(parts[1])
+    user_id = int(parts[2])
+    chosen = int(parts[3])
 
     if call.from_user.id != user_id:
-        await call.answer("Эта кнопка не для вас.", show_alert=True)
+        await call.answer("Эта капча не для вас.", show_alert=True)
         return
 
-    if (chat_id, user_id) not in captcha_pending:
+    pending = captcha_pending.get((chat_id, user_id))
+    if not pending:
         await call.answer("Капча уже недействительна.", show_alert=True)
         return
 
+    correct = pending["answer"]
+
+    if chosen != correct:
+        # Неверный ответ — кикаем
+        captcha_pending.pop((chat_id, user_id), None)
+        stats["captcha_fail"] += 1
+        stats["total"] += 1
+        db_save_stats()
+        full_name = call.from_user.full_name
+        _kick_log(user_id, full_name, chat_id, connected_channels.get(chat_id, str(chat_id)), "капча wrong answer")
+        try:
+            await call.message.edit_text(
+                "❌ {} ошибся — исключён.".format(full_name),
+                parse_mode="HTML"
+            )
+            asyncio.create_task(_delete_message_after(call.message.chat.id, call.message.message_id, 5))
+        except Exception:
+            pass
+        try:
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)
+        except Exception as e:
+            logging.warning("Failed to kick after wrong captcha %s: %s", user_id, e)
+        await call.answer("❌ Неверный ответ!", show_alert=True)
+        return
+
+    # Верный ответ
     captcha_pending.pop((chat_id, user_id), None)
-    db_add(chat_id, user_id)
+    db_add_verified(chat_id, user_id)
 
     try:
         await bot.restrict_chat_member(
@@ -299,9 +452,20 @@ async def cb_captcha_ok(call: CallbackQuery):
         )
     except Exception:
         pass
+    await call.answer("✅ Правильно! Добро пожаловать.")
+    logging.info("Math captcha passed by %s (%s) in chat %s", call.from_user.full_name, user_id, chat_id)
 
-    await call.answer("✅ Проверка пройдена! Добро пожаловать.")
-    logging.info("Captcha passed by %s (%s) in chat %s", call.from_user.full_name, user_id, chat_id)
+
+# ─────────────────────────────────────────────
+# SERVICE MESSAGES AUTO-DELETE
+# ─────────────────────────────────────────────
+@dp.message(F.chat.type.in_({"group", "supergroup"}) & F.content_type.in_(SERVICE_CONTENT_TYPES))
+async def auto_delete_service(msg: Message):
+    """Auto-delete service messages (join/leave/pin etc.) to keep chat clean."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -318,60 +482,74 @@ async def moderate_message(msg: Message):
 
     user_id = msg.from_user.id
     chat_id = msg.chat.id
+    full_name = msg.from_user.full_name or str(user_id)
 
     if is_admin(user_id) or user_id in whitelist:
         return
 
     key = (chat_id, user_id)
 
+    # --- Неверифицирован ---
     if key not in verified_users:
         if key in captcha_pending:
             try:
                 await msg.delete()
                 stats["msg_deleted"] += 1
+                db_save_stats()
             except Exception:
                 pass
             return
 
-        mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, msg.from_user.full_name)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="✅ Я не бот — подтвердить",
-                callback_data="captcha_ok_{}_{}".format(chat_id, user_id)
-            )
-        ]])
-        try:
-            captcha_msg = await msg.reply(
-                "👋 {}, прежде чем писать — подтвердите, что вы не бот.\n\n"
-                "Нажмите кнопку в течение <b>{} секунд</b>.".format(mention, CAPTCHA_TIMEOUT),
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-            captcha_pending[key] = {
-                "msg_id": captcha_msg.message_id,
-                "expire": time.time() + CAPTCHA_TIMEOUT
-            }
-            asyncio.create_task(
-                _captcha_timeout(chat_id, user_id, msg.from_user.full_name, captcha_msg.message_id)
-            )
-        except Exception as e:
-            logging.warning("Failed to send captcha on message: %s", e)
-
+        # Сначала отправляем капчу реплаем, потом удаляем сообщение
+        await _send_math_captcha(chat_id, user_id, full_name, reply_to=msg.message_id)
         try:
             await msg.delete()
             stats["msg_deleted"] += 1
+            db_save_stats()
         except Exception:
             pass
         return
 
+    # --- Верифицирован ---
     text = msg.text or msg.caption or ""
+
+    # CN/AR текст
     if has_cn_or_ar(text):
         try:
             await msg.delete()
             stats["msg_deleted"] += 1
+            db_save_stats()
             await bot.send_message(chat_id, "🚫 Сообщение удалено: недопустимые символы.", parse_mode="HTML")
         except Exception:
             pass
+        return
+
+    # Copy-paste flood
+    if text and check_copypaste(chat_id, user_id, text):
+        stats["copypaste"] += 1
+        stats["msg_deleted"] += 1
+        db_save_stats()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        # Мют на 60 сек
+        try:
+            await bot.restrict_chat_member(
+                chat_id, user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=int(time.time()) + 60
+            )
+            warn_msg = await bot.send_message(
+                chat_id,
+                "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(user_id, full_name),
+                parse_mode="HTML"
+            )
+            asyncio.create_task(_delete_message_after(chat_id, warn_msg.message_id, 15))
+            # сбрасываем трекер
+            copypaste_tracker.pop(key, None)
+        except Exception as e:
+            logging.warning("Copypaste mute failed for %s: %s", user_id, e)
 
 
 # ─────────────────────────────────────────────
@@ -394,7 +572,9 @@ def admin_private(msg: Message):
 MENU_TEXT = (
     "🛡 <b>Антиспам-бот — Панель управления</b>\n\n"
     "/status — статус бота\n"
-    "/stats — статистика\n"
+    "/stats — статистика (персистентная)\n"
+    "/kicklog [N] — последние N киков (по умолчанию 10)\n"
+    "/topviolators [N] — топ N нарушителей\n"
     "/channels — подключённые каналы/группы\n"
     "/addchannel [chat_id] — подключить вручную\n"
     "/removechannel [chat_id] — отключить\n"
@@ -402,6 +582,7 @@ MENU_TEXT = (
     "/setflood [кол-во] [секунд] — порог flood\n"
     "  пример: <code>/setflood 3 5</code>\n"
     "/setcaptcha [секунд] — таймаут капчи (сейчас: {})\n"
+    "/setcopypaste [N] — лимит одинаковых сообщений (сейчас: {})\n"
     "/whitelist add [user_id] — добавить в белый список\n"
     "/whitelist remove [user_id] — убрать\n"
     "/whitelist list — показать белый список\n"
@@ -413,13 +594,13 @@ MENU_TEXT = (
 async def cmd_start(msg: Message):
     if not admin_private(msg):
         return
-    await msg.answer(MENU_TEXT.format(CAPTCHA_TIMEOUT), parse_mode="HTML")
+    await msg.answer(MENU_TEXT.format(CAPTCHA_TIMEOUT, COPYPASTE_LIMIT), parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(msg: Message):
     if not admin_private(msg):
         return
-    await msg.answer(MENU_TEXT.format(CAPTCHA_TIMEOUT), parse_mode="HTML")
+    await msg.answer(MENU_TEXT.format(CAPTCHA_TIMEOUT, COPYPASTE_LIMIT), parse_mode="HTML")
 
 @dp.message(Command("status"))
 async def cmd_status(msg: Message):
@@ -431,20 +612,80 @@ async def cmd_status(msg: Message):
 async def cmd_stats(msg: Message):
     if not admin_private(msg):
         return
+    d = db_read()
+    s = d.get("stats", stats)
     await msg.answer(
-        "📊 <b>Статистика</b>\n\n"
-        "🇨🇳 Китайский/арабский ник: <b>{}</b>\n"
+        "📊 <b>Статистика (накопительная)</b>\n\n"
+        "🇨🇳 cn/ar ник: <b>{}</b>\n"
         "🌊 Flood-вступление: <b>{}</b>\n"
         "⏰ Не прошли капчу: <b>{}</b>\n"
+        "📋 Copy-paste спам: <b>{}</b>\n"
         "🗑 Удалено сообщений: <b>{}</b>\n"
         "──────────────\n"
         "🚫 Всего кикнуто: <b>{}</b>\n"
         "👥 Верифицировано в БД: <b>{}</b>".format(
-            stats["cn_ar"], stats["flood"], stats["captcha_fail"],
-            stats["msg_deleted"], stats["total"], len(verified_users)
+            s.get("cn_ar", 0), s.get("flood", 0), s.get("captcha_fail", 0),
+            s.get("copypaste", 0), s.get("msg_deleted", 0),
+            s.get("total", 0), len(verified_users)
         ),
         parse_mode="HTML"
     )
+
+@dp.message(Command("kicklog"))
+async def cmd_kicklog(msg: Message):
+    if not admin_private(msg):
+        return
+    parts = msg.text.split()
+    n = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10
+    n = min(n, 50)
+    d = db_read()
+    log = d.get("kick_log", [])
+    if not log:
+        await msg.answer("📜 Лог киков пуст.", parse_mode="HTML")
+        return
+    recent = log[-n:]
+    recent.reverse()
+    lines = ["📜 <b>Последние {} киков:</b>\n".format(len(recent))]
+    for e in recent:
+        lines.append(
+            "• <b>{}</b> (<code>{}</code>)\n"
+            "  Причина: <i>{}</i>\n"
+            "  Чат: {}\n"
+            "  Время: {}".format(
+                e.get("name", "?"), e.get("user_id", "?"),
+                e.get("reason", "?"),
+                e.get("chat_title", "?"),
+                e.get("ts", "?")
+            )
+        )
+    await msg.answer("\n".join(lines), parse_mode="HTML")
+
+@dp.message(Command("topviolators"))
+async def cmd_topviolators(msg: Message):
+    if not admin_private(msg):
+        return
+    parts = msg.text.split()
+    n = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 10
+    n = min(n, 30)
+    d = db_read()
+    log = d.get("kick_log", [])
+    if not log:
+        await msg.answer("🏆 Нарушителей пока нет.", parse_mode="HTML")
+        return
+    counts = {}
+    names = {}
+    for e in log:
+        uid = e.get("user_id")
+        if uid:
+            counts[uid] = counts.get(uid, 0) + 1
+            names[uid] = e.get("name", str(uid))
+    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:n]
+    lines = ["🏆 <b>Топ нарушителей:</b>\n"]
+    for i, (uid, cnt) in enumerate(top, 1):
+        lines.append("{}. <b>{}</b> (<code>{}</code>) — {} раз()".format(
+            i, names[uid], uid, cnt
+        ))
+    await msg.answer("\n".join(lines), parse_mode="HTML")
 
 @dp.message(Command("setcaptcha"))
 async def cmd_setcaptcha(msg: Message):
@@ -453,10 +694,22 @@ async def cmd_setcaptcha(msg: Message):
         return
     parts = msg.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
-        await msg.answer("Использование: <code>/setcaptcha [секунд]</code>\nПример: <code>/setcaptcha 60</code>", parse_mode="HTML")
+        await msg.answer("Использование: <code>/setcaptcha [секунд]</code>", parse_mode="HTML")
         return
     CAPTCHA_TIMEOUT = int(parts[1])
     await msg.answer("✅ Таймаут капчи: <b>{} сек.</b>".format(CAPTCHA_TIMEOUT), parse_mode="HTML")
+
+@dp.message(Command("setcopypaste"))
+async def cmd_setcopypaste(msg: Message):
+    global COPYPASTE_LIMIT
+    if not admin_private(msg):
+        return
+    parts = msg.text.split()
+    if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) < 2:
+        await msg.answer("Использование: <code>/setcopypaste [N]</code> (минимум 2)", parse_mode="HTML")
+        return
+    COPYPASTE_LIMIT = int(parts[1])
+    await msg.answer("✅ Лимит copy-paste: <b>{}</b> одинаковых сообщений подряд.".format(COPYPASTE_LIMIT), parse_mode="HTML")
 
 @dp.message(Command("setflood"))
 async def cmd_setflood(msg: Message):
@@ -480,9 +733,11 @@ async def cmd_settings(msg: Message):
         "⚙️ <b>Текущие настройки</b>\n\n"
         "Flood-порог: <b>{} чел. за {} сек.</b>\n"
         "Таймаут капчи: <b>{} сек.</b>\n"
+        "Copy-paste лимит: <b>{} подряд</b>\n"
         "Белый список: <b>{}</b>\n"
         "Верифицировано в БД: <b>{}</b>".format(
-            flood_threshold, flood_window, CAPTCHA_TIMEOUT, wl, len(verified_users)
+            flood_threshold, flood_window, CAPTCHA_TIMEOUT,
+            COPYPASTE_LIMIT, wl, len(verified_users)
         ),
         parse_mode="HTML"
     )
@@ -514,7 +769,7 @@ async def cmd_whitelist(msg: Message):
             whitelist.discard(uid)
             await msg.answer("✅ <code>{}</code> удалён из белого списка.".format(uid), parse_mode="HTML")
     else:
-        await msg.answer("Неверный формат. Напиши /help", parse_mode="HTML")
+        await msg.answer("Неверный ф��рмат. Напиши /help", parse_mode="HTML")
 
 # --- Channel management ---
 @dp.message(Command("channels"))
@@ -617,7 +872,7 @@ async def cb_memberstats(call: CallbackQuery):
 
 async def _send_memberstats(target_chat_id, source_chat_id):
     title = connected_channels.get(source_chat_id, str(source_chat_id))
-    await bot.send_message(target_chat_id, "⏳ Собираю статистику для <b>{}</b>...".format(title), parse_mode="HTML")
+    await bot.send_message(target_chat_id, "⏳ Собиႈаю статистику для <b>{}</b>...".format(title), parse_mode="HTML")
     try:
         count = await bot.get_chat_member_count(source_chat_id)
         admins = await bot.get_chat_administrators(source_chat_id)
