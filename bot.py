@@ -32,16 +32,12 @@ stats = {"cn_ar": 0, "flood": 0, "total": 0, "captcha_fail": 0, "msg_deleted": 0
 flood_threshold = config.FLOOD_THRESHOLD
 flood_window = config.FLOOD_WINDOW
 
-# connected_channels: {chat_id: chat_title}
 connected_channels = {}
-
-# captcha_pending: {(chat_id, user_id): {"msg_id": int, "expire": float}}
 captcha_pending = {}
-
-# verified_users: {(chat_id, user_id)} — прошли капчу, могут писать свободно
 verified_users = set()
 
-CAPTCHA_TIMEOUT = 120  # секунд до кика за неответ
+CAPTCHA_TIMEOUT = 120
+CAPTCHA_SUCCESS_DELETE_AFTER = 20  # секунд до удаления сообщения об успехе
 
 def is_admin(user_id):
     return user_id in config.ADMIN_IDS
@@ -56,6 +52,14 @@ def is_flood_join(chat_id):
         q.popleft()
     return len(q) >= flood_threshold
 
+async def _delete_message_after(chat_id: int, message_id: int, delay: int):
+    """Delete a message after `delay` seconds."""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
 # ───────────────────────────────────────────────
 # NEW MEMBER HANDLER
 # ───────────────────────────────────────────────
@@ -65,7 +69,6 @@ async def on_new_member(event: ChatMemberUpdated):
     chat_id = event.chat.id
     user_id = user.id
 
-    # Авторегистрация чата при добавлении бота
     if user_id == (await bot.get_me()).id:
         connected_channels[chat_id] = event.chat.title or str(chat_id)
         logging.info("Bot added to chat: %s (%s)", event.chat.title, chat_id)
@@ -74,8 +77,7 @@ async def on_new_member(event: ChatMemberUpdated):
                 await bot.send_message(
                     admin_id,
                     "✅ <b>Бот подключён к чату:</b> {}\n<code>{}</code>".format(
-                        event.chat.title or "без названия", chat_id
-                    ),
+                        event.chat.title or "без названия", chat_id),
                     parse_mode="HTML"
                 )
             except Exception:
@@ -86,7 +88,6 @@ async def on_new_member(event: ChatMemberUpdated):
         verified_users.add((chat_id, user_id))
         return
 
-    # Бан по нику (cn/ar)
     full_name = (user.full_name or "") + (user.username or "")
     if has_cn_or_ar(full_name):
         stats["cn_ar"] += 1
@@ -94,14 +95,12 @@ async def on_new_member(event: ChatMemberUpdated):
         try:
             await bot.ban_chat_member(chat_id, user_id)
             await bot.unban_chat_member(chat_id, user_id)
-            logging.info("Kicked %s (%s): cn/ar nick", user.full_name, user_id)
             await _notify_admins("🚫 <b>Кикнут:</b> {} (<code>{}</code>)\n<b>Причина:</b> cn/ar ник\n<b>Чат:</b> {}".format(
                 user.full_name, user_id, event.chat.title or chat_id))
         except Exception as e:
             logging.warning("Failed to kick %s: %s", user_id, e)
         return
 
-    # Flood-вступление
     if is_flood_join(chat_id):
         stats["flood"] += 1
         stats["total"] += 1
@@ -114,7 +113,6 @@ async def on_new_member(event: ChatMemberUpdated):
             logging.warning("Failed to kick %s: %s", user_id, e)
         return
 
-    # Ограничиваем нового участника до прохождения капчи
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
@@ -124,7 +122,6 @@ async def on_new_member(event: ChatMemberUpdated):
     except Exception as e:
         logging.warning("Failed to restrict %s: %s", user_id, e)
 
-    # Отправляем капчу
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, user.full_name)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Я не бот — подтвердить", callback_data="captcha_ok_{}_{}".format(chat_id, user_id))
@@ -133,7 +130,7 @@ async def on_new_member(event: ChatMemberUpdated):
         captcha_msg = await bot.send_message(
             chat_id,
             "👋 {}, добро пожаловать!\n\n"
-            "Пожалуйста, подтвердите, что вы не бот — нажмите кнопку ниже в течение <b>{} секунд</b>.\n"
+            "Пожалуйста, подтвердите, что вы не бот — нажмите кнопку в течение <b>{} секунд</b>.\n"
             "Иначе вы будете исключены.".format(mention, CAPTCHA_TIMEOUT),
             parse_mode="HTML",
             reply_markup=keyboard
@@ -142,7 +139,6 @@ async def on_new_member(event: ChatMemberUpdated):
             "msg_id": captcha_msg.message_id,
             "expire": time.time() + CAPTCHA_TIMEOUT
         }
-        # Запускаем таймер кика
         asyncio.create_task(_captcha_timeout(chat_id, user_id, user.full_name, captcha_msg.message_id))
     except Exception as e:
         logging.warning("Failed to send captcha for %s: %s", user_id, e)
@@ -151,7 +147,7 @@ async def on_new_member(event: ChatMemberUpdated):
 async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
     await asyncio.sleep(CAPTCHA_TIMEOUT)
     if (chat_id, user_id) not in captcha_pending:
-        return  # уже прошёл
+        return
     captcha_pending.pop((chat_id, user_id), None)
     stats["captcha_fail"] += 1
     stats["total"] += 1
@@ -175,11 +171,9 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
 @dp.callback_query(F.data.startswith("captcha_ok_"))
 async def cb_captcha_ok(call: CallbackQuery):
     parts = call.data.split("_")
-    # captcha_ok_{chat_id}_{user_id}
     chat_id = int(parts[2])
     user_id = int(parts[3])
 
-    # Нажать может только сам пользователь
     if call.from_user.id != user_id:
         await call.answer("Эта кнопка не для вас.", show_alert=True)
         return
@@ -191,7 +185,6 @@ async def cb_captcha_ok(call: CallbackQuery):
     captcha_pending.pop((chat_id, user_id), None)
     verified_users.add((chat_id, user_id))
 
-    # Снимаем ограничения
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
@@ -205,12 +198,15 @@ async def cb_captcha_ok(call: CallbackQuery):
     except Exception as e:
         logging.warning("Failed to unrestrict %s: %s", user_id, e)
 
-    # Редактируем капча-сообщение
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, call.from_user.full_name)
     try:
         await call.message.edit_text(
             "✅ {} успешно прошёл проверку и может писать в чате!".format(mention),
             parse_mode="HTML"
+        )
+        # Удаляем сообщение через 20 секунд
+        asyncio.create_task(
+            _delete_message_after(call.message.chat.id, call.message.message_id, CAPTCHA_SUCCESS_DELETE_AFTER)
         )
     except Exception:
         pass
@@ -221,8 +217,6 @@ async def cb_captcha_ok(call: CallbackQuery):
 
 # ───────────────────────────────────────────────
 # MESSAGE MODERATION
-# Первое сообщение от непроверенного — удаляем, отправляем капчу
-# После проверки — ссылки и медиа только для верифицированных
 # ───────────────────────────────────────────────
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def moderate_message(msg: Message):
@@ -232,26 +226,21 @@ async def moderate_message(msg: Message):
     user_id = msg.from_user.id
     chat_id = msg.chat.id
 
-    # Администраторы и whitelist — не трогаем
     if is_admin(user_id) or user_id in whitelist:
         return
 
     key = (chat_id, user_id)
 
-    # Пользователь ещё не верифицирован
     if key not in verified_users:
-        # Удаляем сообщение
         try:
             await msg.delete()
             stats["msg_deleted"] += 1
         except Exception:
             pass
 
-        # Если капча уже отправлена — не спамим повторно
         if key in captcha_pending:
             return
 
-        # Если капча не была выдана при вступлении — отправляем сейчас
         mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, msg.from_user.full_name)
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
@@ -263,7 +252,7 @@ async def moderate_message(msg: Message):
             captcha_msg = await bot.send_message(
                 chat_id,
                 "👋 {}, прежде чем писать — подтвердите, что вы не бот.\n\n"
-                "Нажмите кнопку ниже в течение <b>{} секунд</b>.".format(mention, CAPTCHA_TIMEOUT),
+                "Нажмите кнопку в течение <b>{} секунд</b>.".format(mention, CAPTCHA_TIMEOUT),
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
@@ -278,19 +267,12 @@ async def moderate_message(msg: Message):
             logging.warning("Failed to send captcha on message: %s", e)
         return
 
-    # Пользователь верифицирован — проверяем ссылки и медиа
-    # (разрешено для всех верифицированных, блокируем только у невериф.)
-    # Дополнительно: блокируем CN/AR текст в сообщениях
     text = msg.text or msg.caption or ""
     if has_cn_or_ar(text):
         try:
             await msg.delete()
             stats["msg_deleted"] += 1
-            await bot.send_message(
-                chat_id,
-                "🚫 Сообщение удалено: недопустимые символы.",
-                parse_mode="HTML"
-            )
+            await bot.send_message(chat_id, "🚫 Сообщение удалено: недопустимые символы.", parse_mode="HTML")
         except Exception:
             pass
 
@@ -304,7 +286,6 @@ async def _notify_admins(text: str):
             await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception:
             pass
-
 
 def admin_private(msg: Message):
     return msg.chat.type == "private" and is_admin(msg.from_user.id)
