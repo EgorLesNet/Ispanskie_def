@@ -55,7 +55,8 @@ def db_add(chat_id: int, user_id: int):
     db_save(verified_users)
 
 # --- Runtime state ---
-join_times = {}
+# join_flood: {chat_id: deque of (timestamp, user_id, full_name)}
+join_flood = {}
 whitelist = set()
 stats = {"cn_ar": 0, "flood": 0, "total": 0, "captcha_fail": 0, "msg_deleted": 0}
 flood_threshold = config.FLOOD_THRESHOLD
@@ -86,15 +87,35 @@ SERVICE_CONTENT_TYPES = {
 def is_admin(user_id):
     return user_id in config.ADMIN_IDS
 
-def is_flood_join(chat_id):
+def track_flood_join(chat_id: int, user_id: int, full_name: str):
+    """
+    Добавляет запись о вступлении в окно флуда.
+    Возвращает (is_flood: bool, to_kick: list of (user_id, full_name)).
+    to_kick заполняется только при первом превышении порога (чтобы кикнуть всех сразу).
+    """
     now = time.time()
-    if chat_id not in join_times:
-        join_times[chat_id] = deque()
-    q = join_times[chat_id]
-    q.append(now)
-    while q and now - q[0] > flood_window:
+    if chat_id not in join_flood:
+        join_flood[chat_id] = deque()
+    q = join_flood[chat_id]
+
+    # Убираем устаревшие записи за пределами окна
+    while q and now - q[0][0] > flood_window:
         q.popleft()
-    return len(q) >= flood_threshold
+
+    was_flood = len(q) >= flood_threshold
+    q.append((now, user_id, full_name))
+    is_flood = len(q) >= flood_threshold
+
+    if is_flood and not was_flood:
+        # Порог только что превышен — возвращаем всех в окне для кика
+        to_kick = [(uid, name) for (_, uid, name) in q]
+        q.clear()
+        return True, to_kick
+    elif is_flood:
+        # Флуд уже шёл — кикаем только текущего
+        return True, [(user_id, full_name)]
+    else:
+        return False, []
 
 async def _delete_message_after(chat_id: int, message_id: int, delay: int):
     await asyncio.sleep(delay)
@@ -131,31 +152,54 @@ async def on_new_member(event: ChatMemberUpdated):
         db_add(chat_id, user_id)
         return
 
-    full_name = (user.full_name or "") + (user.username or "")
-    if has_cn_or_ar(full_name):
+    full_name = user.full_name or str(user_id)
+
+    # Проверка CN/AR ника
+    if has_cn_or_ar(full_name + (user.username or "")):
         stats["cn_ar"] += 1
         stats["total"] += 1
         try:
             await bot.ban_chat_member(chat_id, user_id)
             await bot.unban_chat_member(chat_id, user_id)
             await _notify_admins("🚫 <b>Кикнут:</b> {} (<code>{}</code>)\n<b>Причина:</b> cn/ar ник\n<b>Чат:</b> {}".format(
-                user.full_name, user_id, event.chat.title or chat_id))
+                full_name, user_id, event.chat.title or chat_id))
         except Exception as e:
             logging.warning("Failed to kick %s: %s", user_id, e)
         return
 
-    if is_flood_join(chat_id):
-        stats["flood"] += 1
-        stats["total"] += 1
-        try:
-            await bot.ban_chat_member(chat_id, user_id)
-            await bot.unban_chat_member(chat_id, user_id)
-            await _notify_admins("🚫 <b>Кикнут:</b> {} (<code>{}</code>)\n<b>Причина:</b> flood join\n<b>Чат:</b> {}".format(
-                user.full_name, user_id, event.chat.title or chat_id))
-        except Exception as e:
-            logging.warning("Failed to kick %s: %s", user_id, e)
+    # Проверка flood
+    is_flood, to_kick = track_flood_join(chat_id, user_id, full_name)
+    if is_flood:
+        kicked_names = []
+        for (uid, name) in to_kick:
+            try:
+                await bot.ban_chat_member(chat_id, uid)
+                await bot.unban_chat_member(chat_id, uid)
+                # Снимаем капчу если была отправлена
+                pending = captcha_pending.pop((chat_id, uid), None)
+                if pending:
+                    try:
+                        await bot.delete_message(chat_id, pending["msg_id"])
+                    except Exception:
+                        pass
+                stats["flood"] += 1
+                stats["total"] += 1
+                kicked_names.append("{} (<code>{}</code>)".format(name, uid))
+                logging.info("Flood kick: %s (%s) from %s", name, uid, chat_id)
+            except Exception as e:
+                logging.warning("Flood kick failed for %s: %s", uid, e)
+
+        if kicked_names:
+            await _notify_admins(
+                "🌊 <b>Флуд-кик:</b> кикнуто {} чел.\n{}\n<b>Чат:</b> {}".format(
+                    len(kicked_names),
+                    "\n".join(kicked_names),
+                    event.chat.title or chat_id
+                )
+            )
         return
 
+    # Не флуд — отправляем капчу
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
@@ -165,14 +209,13 @@ async def on_new_member(event: ChatMemberUpdated):
     except Exception as e:
         logging.warning("Failed to restrict %s: %s", user_id, e)
 
-    mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, user.full_name)
+    mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
             text="✅ Я не бот — подтвердить",
             callback_data="captcha_ok_{}_{}".format(chat_id, user_id)
         )
     ]])
-    # При вступлении нет сообщения для реплая — отправляем обычным сообщением
     try:
         captcha_msg = await bot.send_message(
             chat_id,
@@ -186,7 +229,7 @@ async def on_new_member(event: ChatMemberUpdated):
             "msg_id": captcha_msg.message_id,
             "expire": time.time() + CAPTCHA_TIMEOUT
         }
-        asyncio.create_task(_captcha_timeout(chat_id, user_id, user.full_name, captcha_msg.message_id))
+        asyncio.create_task(_captcha_timeout(chat_id, user_id, full_name, captcha_msg.message_id))
     except Exception as e:
         logging.warning("Failed to send captcha for %s: %s", user_id, e)
 
@@ -282,7 +325,6 @@ async def moderate_message(msg: Message):
     key = (chat_id, user_id)
 
     if key not in verified_users:
-        # Капча уже отправлена — просто удаляем сообщение
         if key in captcha_pending:
             try:
                 await msg.delete()
@@ -299,7 +341,6 @@ async def moderate_message(msg: Message):
             )
         ]])
         try:
-            # Сначала отправляем капчу как реплай на сообщение пользователя
             captcha_msg = await msg.reply(
                 "👋 {}, прежде чем писать — подтвердите, что вы не бот.\n\n"
                 "Нажмите кнопку в течение <b>{} секунд</b>.".format(mention, CAPTCHA_TIMEOUT),
@@ -316,7 +357,6 @@ async def moderate_message(msg: Message):
         except Exception as e:
             logging.warning("Failed to send captcha on message: %s", e)
 
-        # После отправки капчи удаляем исходное сообщение
         try:
             await msg.delete()
             stats["msg_deleted"] += 1
@@ -324,7 +364,6 @@ async def moderate_message(msg: Message):
             pass
         return
 
-    # Верифицирован — блокируем CN/AR текст
     text = msg.text or msg.caption or ""
     if has_cn_or_ar(text):
         try:
