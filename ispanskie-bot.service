@@ -1,0 +1,18 @@
+[Unit]
+Description=Ispanskie Def Antispam Bot
+After=network.target
+
+[Service]
+# Замените YOUR_USER на имя вашего пользователя (whoami)
+User=YOUR_USER
+# Замените путь на реальный путь до папки с ботом
+WorkingDirectory=/home/YOUR_USER/Ispanskie_def
+ExecStart=/home/YOUR_USER/Ispanskie_def/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
