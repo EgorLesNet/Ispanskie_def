@@ -10,6 +10,7 @@ from aiogram.types import (
 )
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.filters import Command
+from aiogram.enums import ContentType
 import asyncio
 import config
 
@@ -20,7 +21,6 @@ dp = Dispatcher()
 # --- Symbol detectors ---
 CHINESE_RE = re.compile(u'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
 ARABIC_RE  = re.compile(u'[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]')
-LINK_RE    = re.compile(r'(https?://|t\.me/|@\w{3,})', re.IGNORECASE)
 
 def has_cn_or_ar(text):
     return bool(CHINESE_RE.search(text) or ARABIC_RE.search(text))
@@ -37,7 +37,21 @@ captcha_pending = {}
 verified_users = set()
 
 CAPTCHA_TIMEOUT = 120
-CAPTCHA_SUCCESS_DELETE_AFTER = 20  # секунд до удаления сообщения об успехе
+CAPTCHA_SUCCESS_DELETE_AFTER = 20
+
+# Сервисные типы сообщений, которые не нужно модерировать
+SERVICE_CONTENT_TYPES = {
+    ContentType.NEW_CHAT_MEMBERS,
+    ContentType.LEFT_CHAT_MEMBER,
+    ContentType.NEW_CHAT_TITLE,
+    ContentType.NEW_CHAT_PHOTO,
+    ContentType.DELETE_CHAT_PHOTO,
+    ContentType.GROUP_CHAT_CREATED,
+    ContentType.SUPERGROUP_CHAT_CREATED,
+    ContentType.MIGRATE_TO_CHAT_ID,
+    ContentType.MIGRATE_FROM_CHAT_ID,
+    ContentType.PINNED_MESSAGE,
+}
 
 def is_admin(user_id):
     return user_id in config.ADMIN_IDS
@@ -53,7 +67,6 @@ def is_flood_join(chat_id):
     return len(q) >= flood_threshold
 
 async def _delete_message_after(chat_id: int, message_id: int, delay: int):
-    """Delete a message after `delay` seconds."""
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id, message_id)
@@ -204,7 +217,6 @@ async def cb_captcha_ok(call: CallbackQuery):
             "✅ {} успешно прошёл проверку и может писать в чате!".format(mention),
             parse_mode="HTML"
         )
-        # Удаляем сообщение через 20 секунд
         asyncio.create_task(
             _delete_message_after(call.message.chat.id, call.message.message_id, CAPTCHA_SUCCESS_DELETE_AFTER)
         )
@@ -223,6 +235,10 @@ async def moderate_message(msg: Message):
     if not msg.from_user:
         return
 
+    # Пропускаем все сервисные сообщения — вход в чат, выход, пин, изменение названия и т.д.
+    if msg.content_type in SERVICE_CONTENT_TYPES:
+        return
+
     user_id = msg.from_user.id
     chat_id = msg.chat.id
 
@@ -238,6 +254,7 @@ async def moderate_message(msg: Message):
         except Exception:
             pass
 
+        # Капча уже отправлена — не спамим
         if key in captcha_pending:
             return
 
@@ -267,6 +284,7 @@ async def moderate_message(msg: Message):
             logging.warning("Failed to send captcha on message: %s", e)
         return
 
+    # Верифицирован — блокируем CN/AR текст в сообщениях
     text = msg.text or msg.caption or ""
     if has_cn_or_ar(text):
         try:
