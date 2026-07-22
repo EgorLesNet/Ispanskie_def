@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import re
 import time
 import logging
@@ -12,17 +13,17 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
-# ─── Детектор китайских/арабских символов ───────────────────────────────────
-CHINESE_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
-ARABIC_RE  = re.compile(r'[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]')
+# Detector Chinese/Arabic symbols
+CHINESE_RE = re.compile(u'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
+ARABIC_RE  = re.compile(u'[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]')
 
-def has_cn_or_ar(text: str) -> bool:
+def has_cn_or_ar(text):
     return bool(CHINESE_RE.search(text) or ARABIC_RE.search(text))
 
-# ─── Очередь для flood-детекции ──────────────────────────────────────────────
-join_times: dict[int, deque] = {}
+# Flood-join detection queue
+join_times = {}
 
-def is_flood_join(chat_id: int) -> bool:
+def is_flood_join(chat_id):
     now = time.time()
     if chat_id not in join_times:
         join_times[chat_id] = deque()
@@ -32,7 +33,6 @@ def is_flood_join(chat_id: int) -> bool:
         q.popleft()
     return len(q) >= config.FLOOD_THRESHOLD
 
-# ─── Обработчик новых участников ─────────────────────────────────────────────
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_new_member(event: ChatMemberUpdated):
     user = event.new_chat_member.user
@@ -45,25 +45,24 @@ async def on_new_member(event: ChatMemberUpdated):
     full_name = (user.full_name or "") + (user.username or "")
     if has_cn_or_ar(full_name):
         should_ban = True
-        reason = f"китайский/арабский ник: {user.full_name}"
+        reason = "cn/ar nick: " + user.full_name
 
     if not should_ban and is_flood_join(chat_id):
         should_ban = True
-        reason = f"массовое вступление (flood)"
+        reason = "flood join"
 
     if should_ban:
         try:
             await bot.ban_chat_member(chat_id, user_id)
             await bot.unban_chat_member(chat_id, user_id)
-            logging.info(f"Кикнут {user.full_name} ({user_id}): {reason}")
+            logging.info("Kicked %s (%s): %s", user.full_name, user_id, reason)
         except Exception as e:
-            logging.warning(f"Не удалось кикнуть {user_id}: {e}")
+            logging.warning("Failed to kick %s: %s", user_id, e)
 
-# ─── Команда /status для проверки работы ─────────────────────────────────────
 @dp.message(F.text == "/status")
 async def status(msg: Message):
     if msg.from_user.id in config.ADMIN_IDS:
-        await msg.answer("✅ Антиспам-бот работает")
+        await msg.answer("Antispam bot is running")
 
 async def main():
     await dp.start_polling(bot)
