@@ -5,7 +5,7 @@
 # Делает git pull перед запуском, затем стартует bot.py
 # ============================================================
 
-BOT_DIR="$HOME/bots/Ispanskie_def"
+BOT_DIR="$HOME/Ispanskie_def"
 PYTHON="/usr/local/bin/python3"
 LOG="$BOT_DIR/bot.log"
 

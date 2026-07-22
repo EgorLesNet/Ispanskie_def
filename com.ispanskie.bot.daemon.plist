@@ -6,37 +6,29 @@
     <key>Label</key>
     <string>com.ispanskie.bot</string>
 
-    <!-- Полные пути без $HOME — daemon не знает переменных среды -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/start_bot.sh</string>
+        <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def/start_bot.sh</string>
     </array>
 
-    <!-- Запуск при старте системы -->
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- Перезапуск при падении -->
     <key>KeepAlive</key>
     <true/>
 
-    <!-- От какого юзера запускать процесс -->
     <key>UserName</key>
     <string>ТВОЙ_ЮЗЕР</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/bot.log</string>
+    <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def/bot.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/bot_error.log</string>
+    <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def/bot_error.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def</string>
-
-    <!-- Ожидаем сеть перед стартом (git pull нужен интернет) -->
-    <key>WaitForDebugger</key>
-    <false/>
+    <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def</string>
 
     <key>EnvironmentVariables</key>
     <dict>

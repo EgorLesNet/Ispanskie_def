@@ -9,7 +9,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/start_bot.sh</string>
+        <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def/start_bot.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -19,12 +19,12 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/bot.log</string>
+    <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def/bot.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/bot_error.log</string>
+    <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def/bot_error.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def</string>
+    <string>/Users/ТВОЙ_ЮЗЕР/Ispanskie_def</string>
 </dict>
 </plist>
