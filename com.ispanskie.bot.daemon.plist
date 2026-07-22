@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ispanskie.bot</string>
+
+    <!-- Полные пути без $HOME — daemon не знает переменных среды -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/start_bot.sh</string>
+    </array>
+
+    <!-- Запуск при старте системы -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Перезапуск при падении -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- От какого юзера запускать процесс -->
+    <key>UserName</key>
+    <string>ТВОЙ_ЮЗЕР</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/bot.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def/bot_error.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/ТВОЙ_ЮЗЕР/bots/Ispanskie_def</string>
+
+    <!-- Ожидаем сеть перед стартом (git pull нужен интернет) -->
+    <key>WaitForDebugger</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/ТВОЙ_ЮЗЕР</string>
+    </dict>
+</dict>
+</plist>
