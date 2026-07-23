@@ -160,7 +160,6 @@ def db_add_kick_log(entry: dict):
 _db_init = db_read()
 verified_users = set(tuple(pair) for pair in _db_init.get("verified_users", []))
 stats = _db_init.get("stats", dict(DEFAULT_DB["stats"]))
-# FIX #5: whitelist хранит int — при загрузке приводим явно
 whitelist = set(int(u) for u in _db_init.get("whitelist", []))
 connected_channels = {int(k): v for k, v in _db_init.get("connected_channels", {}).items()}
 
@@ -177,15 +176,7 @@ logging.info("Loaded %d verified users, %d whitelist, %d channels from db.json",
              len(verified_users), len(whitelist), len(connected_channels))
 
 join_flood = {}
-
-# captcha_pending: (chat_id, user_id) -> {
-#   "captcha_msg_id": int | None,
-#   "user_msg_id": int,
-#   "expire": float,
-#   "token": float   ← FIX #2: уникальный токен для защиты от stale таймаутов
-# }
 captcha_pending = {}
-
 copypaste_tracker = {}
 
 CAPTCHA_SUCCESS_DELETE_AFTER = 5
@@ -223,7 +214,7 @@ def has_swear(text: str) -> bool:
     return bool(swear_re.search(text))
 
 # ─────────────────────────────────────────────
-# HELPERS  (объявлены до использования — FIX #6)
+# HELPERS
 # ─────────────────────────────────────────────
 async def _notify_admins(text: str):
     for admin_id in config.ADMIN_IDS:
@@ -251,6 +242,26 @@ def _kick_log(user_id, name, chat_id, chat_title, reason):
         "reason": reason,
         "ts": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     })
+
+# ─────────────────────────────────────────────
+# THREAD-AWARE send_message helper
+# В группе комментариев msg.message_thread_id содержит id треда поста.
+# Передаём его во все публичные предупреждения, чтобы они появлялись
+# именно в комментариях к нужному посту, а не в корне чата.
+# ─────────────────────────────────────────────
+async def _send_in_thread(chat_id: int, thread_id: int | None, text: str,
+                          parse_mode: str = "HTML", **kwargs) -> "Message | None":
+    """Отправляет сообщение в тред (комментарии), если thread_id задан."""
+    try:
+        return await bot.send_message(
+            chat_id, text,
+            parse_mode=parse_mode,
+            message_thread_id=thread_id,
+            **kwargs
+        )
+    except Exception as e:
+        logging.warning("_send_in_thread failed chat=%s thread=%s: %s", chat_id, thread_id, e)
+        return None
 
 # ─────────────────────────────────────────────
 # BUTTON CAPTCHA
@@ -330,7 +341,6 @@ async def on_new_member(event: ChatMemberUpdated):
                 pass
         return
 
-    # FIX #5: whitelist содержит int, сравниваем корректно
     if user_id in whitelist:
         db_add_verified(chat_id, user_id)
         return
@@ -378,28 +388,18 @@ async def on_new_member(event: ChatMemberUpdated):
                 "🌊 <b>Флуд-кик:</b> {} чел.\n{}\n<b>Чат:</b> {}".format(
                     len(kicked_names), "\n".join(kicked_names), chat_title))
         return
-    # Капча придёт когда напишет первое сообщение (логика в moderate_message)
 
 
 # ─────────────────────────────────────────────
-# CAPTCHA: отправка и таймаут
-#
-# Логика:
-#   1. Пользователь пишет сообщение
-#   2. Сообщение ОСТАЁТСЯ (не удаляется)
-#   3. Бот отправляет капчу ответом на это сообщение
-#   4а. Капча решена → сообщение остаётся, капча удаляется через 5 сек
-#   4б. 30 сек прошло → удаляется исходное сообщение + капча, кика нет
+# CAPTCHA
 # ─────────────────────────────────────────────
-async def _send_captcha_for_message(chat_id: int, user_id: int, full_name: str, user_msg_id: int):
-    """Отправляет капчу как reply на сообщение пользователя.
-    FIX #1 & #7: слот резервируется здесь, captcha_msg_id обновляется после отправки.
-    Если отправка упала — слот очищается, таймер не запускается.
-    """
+async def _send_captcha_for_message(chat_id: int, user_id: int, full_name: str,
+                                     user_msg_id: int, thread_id: int | None):
     token = time.time()
     captcha_pending[(chat_id, user_id)] = {
         "captcha_msg_id": None,
         "user_msg_id": user_msg_id,
+        "thread_id": thread_id,
         "expire": token + CAPTCHA_TIMEOUT,
         "token": token,
     }
@@ -417,19 +417,16 @@ async def _send_captcha_for_message(chat_id: int, user_id: int, full_name: str, 
             text,
             parse_mode="HTML",
             reply_markup=keyboard,
-            reply_to_message_id=user_msg_id
+            reply_to_message_id=user_msg_id,
+            message_thread_id=thread_id,
         )
     except Exception as e:
-        # FIX #1: отправка упала — чистим слот, чтобы юзер мог написать снова
         captcha_pending.pop((chat_id, user_id), None)
         logging.warning("send captcha failed %s: %s", user_id, e)
         return
 
-    # Обновляем слот реальным id капчи
-    # FIX #7: проверяем, что слот не занят более новым токеном (защита от двойного вызова)
     slot = captcha_pending.get((chat_id, user_id))
     if slot is None or slot["token"] != token:
-        # Слот уже занят новой капчей — удаляем только что отправленное сообщение
         try:
             await bot.delete_message(chat_id, captcha_msg.message_id)
         except Exception:
@@ -444,13 +441,10 @@ async def _send_captcha_for_message(chat_id: int, user_id: int, full_name: str, 
 
 async def _captcha_timeout(chat_id: int, user_id: int,
                             captcha_msg_id: int, user_msg_id: int, token: float):
-    """FIX #2: проверяем token — если pending изменился (юзер решил и снова написал),
-    старый таймаут не трогает новую капчу."""
     await asyncio.sleep(CAPTCHA_TIMEOUT)
 
     slot = captcha_pending.get((chat_id, user_id))
     if slot is None or slot.get("token") != token:
-        # Капча уже решена или заменена новой — ничего не делаем
         return
 
     captcha_pending.pop((chat_id, user_id), None)
@@ -486,7 +480,6 @@ async def cb_button_captcha(call: CallbackQuery):
         await call.answer("Капча уже недействительна.", show_alert=True)
         return
 
-    # FIX #7: капча ещё в процессе отправки (captcha_msg_id=None) — редкий кейс
     if slot.get("captcha_msg_id") is None:
         await call.answer("Подождите секунду и попробуйте снова.", show_alert=True)
         return
@@ -515,7 +508,6 @@ async def cb_button_captcha(call: CallbackQuery):
         pass
 
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
-    # FIX #3: редактируем сообщение капчи, затем удаляем через таймер
     try:
         await call.message.edit_text(
             "✅ {} подтвердил, что не бот!".format(mention),
@@ -526,7 +518,6 @@ async def cb_button_captcha(call: CallbackQuery):
             _delete_message_after(call.message.chat.id, call.message.message_id,
                                    CAPTCHA_SUCCESS_DELETE_AFTER))
     except Exception:
-        # Если edit_text упал (сообщение удалено) — просто удаляем напрямую
         try:
             await bot.delete_message(call.message.chat.id, call.message.message_id)
         except Exception:
@@ -1033,11 +1024,6 @@ async def _send_memberstats(target_chat_id, source_chat_id):
 
 # ─────────────────────────────────────────────
 # MESSAGE MODERATION
-# Порядок важен: moderate_message зарегистрирован последним.
-# Логика капчи:
-#   - Невалидный юзер пишет → сообщение ОСТАЁТСЯ → отправляется капча (reply)
-#   - Капча решена → пост остаётся, капча удаляется через 5 сек
-#   - 30 сек без решения → удаляется пост + капча, кика нет
 # ─────────────────────────────────────────────
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def moderate_message(msg: Message):
@@ -1050,18 +1036,17 @@ async def moderate_message(msg: Message):
 
     user_id = msg.from_user.id
     chat_id = msg.chat.id
+    # thread_id присутствует в группе комментариев — передаём во все ответы
+    thread_id = msg.message_thread_id
     full_name = msg.from_user.full_name or str(user_id)
 
-    # FIX #5: is_admin + whitelist проверяем ДО verified_users
     if is_admin(user_id) or user_id in whitelist:
         return
 
     key = (chat_id, user_id)
 
-    # Не верифицирован
     if key not in verified_users:
         if key in captcha_pending:
-            # Уже ждёт капчу — удаляем лишние сообщения пока не решит
             try:
                 await msg.delete()
                 stats["msg_deleted"] += 1
@@ -1069,8 +1054,7 @@ async def moderate_message(msg: Message):
             except Exception:
                 pass
             return
-        # Первое сообщение: оставляем пост, отправляем капчу
-        await _send_captcha_for_message(chat_id, user_id, full_name, msg.message_id)
+        await _send_captcha_for_message(chat_id, user_id, full_name, msg.message_id, thread_id)
         return
 
     text = msg.text or msg.caption or ""
@@ -1081,7 +1065,9 @@ async def moderate_message(msg: Message):
             await msg.delete()
             stats["msg_deleted"] += 1
             db_save_stats()
-            await bot.send_message(chat_id, "🚫 Сообщение удалено: недопустимые символы.", parse_mode="HTML")
+            # FIX: отправляем в тред, чтобы было видно в комментариях
+            await _send_in_thread(chat_id, thread_id,
+                                   "🚫 Сообщение удалено: недопустимые символы.")
         except Exception:
             pass
         return
@@ -1093,8 +1079,10 @@ async def moderate_message(msg: Message):
         db_save_stats()
         try:
             await msg.delete()
-            warn = await bot.send_message(chat_id, SWEAR_REPLY)
-            asyncio.create_task(_delete_message_after(chat_id, warn.message_id, 10))
+            # FIX: отправляем в тред, чтобы было видно в комментариях
+            warn = await _send_in_thread(chat_id, thread_id, SWEAR_REPLY)
+            if warn:
+                asyncio.create_task(_delete_message_after(chat_id, warn.message_id, 10))
         except Exception:
             pass
         return
@@ -1114,12 +1102,14 @@ async def moderate_message(msg: Message):
                 permissions=ChatPermissions(can_send_messages=False),
                 until_date=int(time.time()) + 60
             )
-            warn_msg = await bot.send_message(
-                chat_id,
-                "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(user_id, full_name),
-                parse_mode="HTML"
+            # FIX: отправляем в тред, чтобы было видно в комментариях
+            warn_msg = await _send_in_thread(
+                chat_id, thread_id,
+                "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(
+                    user_id, full_name)
             )
-            asyncio.create_task(_delete_message_after(chat_id, warn_msg.message_id, 15))
+            if warn_msg:
+                asyncio.create_task(_delete_message_after(chat_id, warn_msg.message_id, 15))
             copypaste_tracker.pop(key, None)
         except Exception as e:
             logging.warning("copypaste mute failed %s: %s", user_id, e)
