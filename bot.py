@@ -403,10 +403,16 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
 
 # ─────────────────────────────────────────────
 # BUTTON CAPTCHA CALLBACK
+# FIX #1 & #5: используем split("_", 2) чтобы не ломать отрицательные chat_id вида -1001234567890
+# btncap_-1001234567890_123456 → parts = ["btncap", "-1001234567890", "123456"]
 # ─────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("btncap_"))
 async def cb_button_captcha(call: CallbackQuery):
-    parts = call.data.split("_")
+    # split максимум на 3 части: "btncap", chat_id (может быть отрицательным), user_id
+    parts = call.data.split("_", 2)
+    if len(parts) != 3:
+        await call.answer("Неверный формат капчи.", show_alert=True)
+        return
     chat_id = int(parts[1])
     user_id = int(parts[2])
 
@@ -462,9 +468,17 @@ async def auto_delete_service(msg: Message):
 
 # ─────────────────────────────────────────────
 # MESSAGE MODERATION
+# FIX #2: убираем фильтр по типу чата — охватываем комментарии к постам канала
+# (там chat.type тоже "supergroup", но linked_channel / is_forum может вести себя иначе)
+# Оставляем проверки внутри хендлера.
+# FIX #3: сначала отправляем капчу, потом удаляем сообщение — иначе reply_to_message_id
+# указывает на уже удалённое сообщение и Telegram вернёт ошибку.
 # ─────────────────────────────────────────────
-@dp.message(F.chat.type.in_({"group", "supergroup"}))
+@dp.message()
 async def moderate_message(msg: Message):
+    # Пропускаем личку и каналы (не группы/супергруппы и не комментарии)
+    if msg.chat.type not in ("group", "supergroup"):
+        return
     if msg.content_type in SERVICE_CONTENT_TYPES:
         return
     if msg.sender_chat is not None:
@@ -491,6 +505,7 @@ async def moderate_message(msg: Message):
             except Exception:
                 pass
             return
+        # FIX #3: сначала отправляем капчу (reply_to ещё живо), потом удаляем сообщение
         await _send_button_captcha(chat_id, user_id, full_name, reply_to=msg.message_id)
         try:
             await msg.delete()
@@ -1055,8 +1070,21 @@ async def _send_memberstats(target_chat_id, source_chat_id):
         parse_mode="HTML")
 
 
+# ─────────────────────────────────────────────
+# MAIN
+# FIX #4: явно передаём allowed_updates с "chat_member" — в aiogram v3 он не включён по умолчанию,
+# иначе on_new_member не срабатывает в группах комментариев.
+# ─────────────────────────────────────────────
 async def main():
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot,
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "chat_member",
+            "my_chat_member",
+        ]
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
