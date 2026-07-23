@@ -4,6 +4,7 @@ import time
 import json
 import os
 import logging
+import hashlib
 from collections import deque
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
@@ -20,6 +21,9 @@ import config
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
+
+# FIX #5: кешируем bot_id при старте, чтобы не делать get_me() на каждый join
+BOT_ID: int = 0
 
 # --- Symbol detectors ---
 CHINESE_RE = re.compile(u'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
@@ -103,16 +107,20 @@ def db_write(data: dict):
     except Exception as e:
         logging.warning("db_write error: %s", e)
 
+# FIX #4: все db_write вызываются через asyncio.to_thread чтобы не блокировать event loop
+async def db_write_async(data: dict):
+    await asyncio.to_thread(db_write, data)
+
 def db_add_verified(chat_id: int, user_id: int):
     verified_users.add((chat_id, user_id))
     d = db_read()
     d["verified_users"] = [list(p) for p in verified_users]
-    db_write(d)
+    asyncio.create_task(db_write_async(d))
 
 def db_save_stats():
     d = db_read()
     d["stats"] = stats
-    db_write(d)
+    asyncio.create_task(db_write_async(d))
 
 def db_save_settings():
     d = db_read()
@@ -122,22 +130,22 @@ def db_save_settings():
         "captcha_timeout": CAPTCHA_TIMEOUT,
         "copypaste_limit": COPYPASTE_LIMIT
     }
-    db_write(d)
+    asyncio.create_task(db_write_async(d))
 
 def db_save_whitelist():
     d = db_read()
     d["whitelist"] = list(whitelist)
-    db_write(d)
+    asyncio.create_task(db_write_async(d))
 
 def db_save_channels():
     d = db_read()
     d["connected_channels"] = {str(k): v for k, v in connected_channels.items()}
-    db_write(d)
+    asyncio.create_task(db_write_async(d))
 
 def db_save_swear_words():
     d = db_read()
     d["swear_words"] = list(swear_words)
-    db_write(d)
+    asyncio.create_task(db_write_async(d))
 
 def db_add_kick_log(entry: dict):
     d = db_read()
@@ -146,7 +154,7 @@ def db_add_kick_log(entry: dict):
     if len(log) > 1000:
         log = log[-1000:]
     d["kick_log"] = log
-    db_write(d)
+    asyncio.create_task(db_write_async(d))
 
 # ─────────────────────────────────────────────
 # INIT RUNTIME STATE FROM DB
@@ -221,12 +229,16 @@ def make_captcha_keyboard(chat_id, user_id):
 
 # ─────────────────────────────────────────────
 # COPY-PASTE FLOOD
+# FIX #6: используем hashlib вместо hash() — hash() нестабилен между запусками Python (PYTHONHASHSEED)
 # ─────────────────────────────────────────────
+def _stable_hash(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+
 def check_copypaste(chat_id: int, user_id: int, text: str) -> bool:
     if not text or len(text.strip()) < 5:
         return False
     key = (chat_id, user_id)
-    text_hash = hash(text.strip().lower())
+    text_hash = _stable_hash(text.strip().lower())
     now = time.time()
     if key not in copypaste_tracker:
         copypaste_tracker[key] = deque()
@@ -286,7 +298,8 @@ async def on_new_member(event: ChatMemberUpdated):
     user_id = user.id
     chat_title = event.chat.title or str(chat_id)
 
-    if user_id == (await bot.get_me()).id:
+    # FIX #5: используем кешированный BOT_ID вместо await bot.get_me() на каждый join
+    if user_id == BOT_ID:
         connected_channels[chat_id] = chat_title
         db_save_channels()
         for admin_id in config.ADMIN_IDS:
@@ -376,6 +389,8 @@ async def _send_button_captcha(chat_id, user_id, full_name, reply_to=None):
         }
         asyncio.create_task(_captcha_timeout(chat_id, user_id, full_name, captcha_msg.message_id))
     except Exception as e:
+        # FIX #1: если отправка не удалась — убираем предварительную резервацию
+        captcha_pending.pop((chat_id, user_id), None)
         logging.warning("send captcha failed %s: %s", user_id, e)
 
 
@@ -403,12 +418,10 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
 
 # ─────────────────────────────────────────────
 # BUTTON CAPTCHA CALLBACK
-# FIX #1 & #5: используем split("_", 2) чтобы не ломать отрицательные chat_id вида -1001234567890
-# btncap_-1001234567890_123456 → parts = ["btncap", "-1001234567890", "123456"]
+# split("_", 2): "btncap_-1001234567890_123456" → ["btncap", "-1001234567890", "123456"]
 # ─────────────────────────────────────────────
 @dp.callback_query(F.data.startswith("btncap_"))
 async def cb_button_captcha(call: CallbackQuery):
-    # split максимум на 3 части: "btncap", chat_id (может быть отрицательным), user_id
     parts = call.data.split("_", 2)
     if len(parts) != 3:
         await call.answer("Неверный формат капчи.", show_alert=True)
@@ -429,12 +442,19 @@ async def cb_button_captcha(call: CallbackQuery):
     captcha_pending.pop((chat_id, user_id), None)
     db_add_verified(chat_id, user_id)
 
+    # FIX #2: can_send_media_messages устарел в Bot API 6.0+, используем новые поля
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
             permissions=ChatPermissions(
                 can_send_messages=True,
-                can_send_media_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
                 can_send_other_messages=True,
                 can_add_web_page_previews=True,
             )
@@ -464,107 +484,6 @@ async def auto_delete_service(msg: Message):
         await msg.delete()
     except Exception:
         pass
-
-
-# ─────────────────────────────────────────────
-# MESSAGE MODERATION
-# FIX #2: убираем фильтр по типу чата — охватываем комментарии к постам канала
-# (там chat.type тоже "supergroup", но linked_channel / is_forum может вести себя иначе)
-# Оставляем проверки внутри хендлера.
-# FIX #3: сначала отправляем капчу, потом удаляем сообщение — иначе reply_to_message_id
-# указывает на уже удалённое сообщение и Telegram вернёт ошибку.
-# ─────────────────────────────────────────────
-@dp.message()
-async def moderate_message(msg: Message):
-    # Пропускаем личку и каналы (не группы/супергруппы и не комментарии)
-    if msg.chat.type not in ("group", "supergroup"):
-        return
-    if msg.content_type in SERVICE_CONTENT_TYPES:
-        return
-    if msg.sender_chat is not None:
-        return
-    if not msg.from_user:
-        return
-
-    user_id = msg.from_user.id
-    chat_id = msg.chat.id
-    full_name = msg.from_user.full_name or str(user_id)
-
-    if is_admin(user_id) or user_id in whitelist:
-        return
-
-    key = (chat_id, user_id)
-
-    # Не верифицирован
-    if key not in verified_users:
-        if key in captcha_pending:
-            try:
-                await msg.delete()
-                stats["msg_deleted"] += 1
-                db_save_stats()
-            except Exception:
-                pass
-            return
-        # FIX #3: сначала отправляем капчу (reply_to ещё живо), потом удаляем сообщение
-        await _send_button_captcha(chat_id, user_id, full_name, reply_to=msg.message_id)
-        try:
-            await msg.delete()
-            stats["msg_deleted"] += 1
-            db_save_stats()
-        except Exception:
-            pass
-        return
-
-    text = msg.text or msg.caption or ""
-
-    # CN/AR текст
-    if has_cn_or_ar(text):
-        try:
-            await msg.delete()
-            stats["msg_deleted"] += 1
-            db_save_stats()
-            await bot.send_message(chat_id, "🚫 Сообщение удалено: недопустимые символы.", parse_mode="HTML")
-        except Exception:
-            pass
-        return
-
-    # Мат
-    if text and has_swear(text):
-        stats["swear"] += 1
-        stats["msg_deleted"] += 1
-        db_save_stats()
-        try:
-            await msg.delete()
-            warn = await bot.send_message(chat_id, SWEAR_REPLY)
-            asyncio.create_task(_delete_message_after(chat_id, warn.message_id, 10))
-        except Exception:
-            pass
-        return
-
-    # Copy-paste flood
-    if text and check_copypaste(chat_id, user_id, text):
-        stats["copypaste"] += 1
-        stats["msg_deleted"] += 1
-        db_save_stats()
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-        try:
-            await bot.restrict_chat_member(
-                chat_id, user_id,
-                permissions=ChatPermissions(can_send_messages=False),
-                until_date=int(time.time()) + 60
-            )
-            warn_msg = await bot.send_message(
-                chat_id,
-                "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(user_id, full_name),
-                parse_mode="HTML"
-            )
-            asyncio.create_task(_delete_message_after(chat_id, warn_msg.message_id, 15))
-            copypaste_tracker.pop(key, None)
-        except Exception as e:
-            logging.warning("copypaste mute failed %s: %s", user_id, e)
 
 
 # ─────────────────────────────────────────────
@@ -1071,11 +990,118 @@ async def _send_memberstats(target_chat_id, source_chat_id):
 
 
 # ─────────────────────────────────────────────
+# MESSAGE MODERATION
+# FIX #3: moderate_message зарегистрирован ПОСЛЕДНИМ — все команды выше него
+# и не будут им перехвачены в aiogram v3 (порядок регистрации важен).
+# Фильтр по типу чата возвращён в декоратор — так личка никогда не попадает сюда,
+# команды в личке корректно обрабатываются своими хендлерами.
+# FIX #1: атомарная пре-резерв��ция captcha_pending перед отправкой капчи
+# чтобы при параллельных сообщениях капча не отправлялась дважды.
+# ─────────────────────────────────────────────
+@dp.message(F.chat.type.in_({"group", "supergroup"}))
+async def moderate_message(msg: Message):
+    if msg.content_type in SERVICE_CONTENT_TYPES:
+        return
+    if msg.sender_chat is not None:
+        return
+    if not msg.from_user:
+        return
+
+    user_id = msg.from_user.id
+    chat_id = msg.chat.id
+    full_name = msg.from_user.full_name or str(user_id)
+
+    if is_admin(user_id) or user_id in whitelist:
+        return
+
+    key = (chat_id, user_id)
+
+    # Не верифицирован
+    if key not in verified_users:
+        if key in captcha_pending:
+            try:
+                await msg.delete()
+                stats["msg_deleted"] += 1
+                db_save_stats()
+            except Exception:
+                pass
+            return
+        # FIX #1: атомарно резервируем слот до отправки — защита от race condition
+        # при быстрых нескольких сообщениях подряд
+        captcha_pending[key] = {"msg_id": None, "expire": time.time() + CAPTCHA_TIMEOUT}
+        # FIX #3: сначала капча (reply_to ещё живо), потом удаление
+        await _send_button_captcha(chat_id, user_id, full_name, reply_to=msg.message_id)
+        try:
+            await msg.delete()
+            stats["msg_deleted"] += 1
+            db_save_stats()
+        except Exception:
+            pass
+        return
+
+    text = msg.text or msg.caption or ""
+
+    # CN/AR текст
+    if has_cn_or_ar(text):
+        try:
+            await msg.delete()
+            stats["msg_deleted"] += 1
+            db_save_stats()
+            await bot.send_message(chat_id, "🚫 Сообщение удалено: недопустимые символы.", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    # Мат
+    if text and has_swear(text):
+        stats["swear"] += 1
+        stats["msg_deleted"] += 1
+        db_save_stats()
+        try:
+            await msg.delete()
+            warn = await bot.send_message(chat_id, SWEAR_REPLY)
+            asyncio.create_task(_delete_message_after(chat_id, warn.message_id, 10))
+        except Exception:
+            pass
+        return
+
+    # Copy-paste flood
+    if text and check_copypaste(chat_id, user_id, text):
+        stats["copypaste"] += 1
+        stats["msg_deleted"] += 1
+        db_save_stats()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        try:
+            await bot.restrict_chat_member(
+                chat_id, user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=int(time.time()) + 60
+            )
+            warn_msg = await bot.send_message(
+                chat_id,
+                "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(user_id, full_name),
+                parse_mode="HTML"
+            )
+            asyncio.create_task(_delete_message_after(chat_id, warn_msg.message_id, 15))
+            copypaste_tracker.pop(key, None)
+        except Exception as e:
+            logging.warning("copypaste mute failed %s: %s", user_id, e)
+
+
+# ─────────────────────────────────────────────
 # MAIN
-# FIX #4: явно передаём allowed_updates с "chat_member" — в aiogram v3 он не включён по умолчанию,
-# иначе on_new_member не срабатывает в группах комментариев.
+# FIX #4 (из прошлого коммита): allowed_updates с chat_member
+# FIX #5: кешируем BOT_ID один раз при старте
 # ─────────────────────────────────────────────
 async def main():
+    global BOT_ID
+    me = await bot.get_me()
+    BOT_ID = me.id
+    logging.info("Bot started: @%s (id=%d)", me.username, BOT_ID)
+
     await dp.start_polling(
         bot,
         allowed_updates=[
