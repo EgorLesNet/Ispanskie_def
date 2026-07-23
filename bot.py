@@ -244,11 +244,47 @@ def _kick_log(user_id, name, chat_id, chat_title, reason):
     })
 
 # ─────────────────────────────────────────────
-# THREAD-AWARE send_message helper
-# В группе комментариев msg.message_thread_id содержит id треда поста.
-# Передаём его во все публичные предупреждения, чтобы они появлялись
-# именно в комментариях к нужному посту, а не в корне чата.
+# THREAD-AWARE reply helper
+# Отправляет предупреждение как реплай на сообщение пользователя,
+# затем удаляет исходное сообщение и через `warn_delete_after` сек
+# удаляет само предупреждение — чтобы пользователь точно видел факт удаления.
 # ─────────────────────────────────────────────
+async def _warn_and_delete(
+    msg: Message,
+    text: str,
+    parse_mode: str = "HTML",
+    warn_delete_after: int = 4,
+) -> None:
+    """
+    1. Отправляет предупреждение реплаем на msg (reply_to_message_id=msg.message_id).
+    2. Удаляет исходное сообщение msg.
+    3. Через warn_delete_after секунд удаляет само предупреждение.
+    """
+    warn_msg = None
+    try:
+        warn_msg = await bot.send_message(
+            msg.chat.id,
+            text,
+            parse_mode=parse_mode,
+            reply_to_message_id=msg.message_id,
+            message_thread_id=msg.message_thread_id,
+        )
+    except Exception as e:
+        logging.warning("_warn_and_delete send failed: %s", e)
+
+    # Удаляем исходное сообщение
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    # Откладываем удаление предупреждения
+    if warn_msg:
+        asyncio.create_task(
+            _delete_message_after(msg.chat.id, warn_msg.message_id, warn_delete_after)
+        )
+
+
 async def _send_in_thread(chat_id: int, thread_id: int | None, text: str,
                           parse_mode: str = "HTML", **kwargs) -> "Message | None":
     """Отправляет сообщение в тред (комментарии), если thread_id задан."""
@@ -1036,7 +1072,6 @@ async def moderate_message(msg: Message):
 
     user_id = msg.from_user.id
     chat_id = msg.chat.id
-    # thread_id присутствует в группе комментариев — передаём во все ответы
     thread_id = msg.message_thread_id
     full_name = msg.from_user.full_name or str(user_id)
 
@@ -1061,15 +1096,10 @@ async def moderate_message(msg: Message):
 
     # CN/AR текст
     if has_cn_or_ar(text):
-        try:
-            await msg.delete()
-            stats["msg_deleted"] += 1
-            db_save_stats()
-            # FIX: отправляем в тред, чтобы было видно в комментариях
-            await _send_in_thread(chat_id, thread_id,
-                                   "🚫 Сообщение удалено: недопустимые символы.")
-        except Exception:
-            pass
+        stats["msg_deleted"] += 1
+        db_save_stats()
+        # Сначала реплай-предупреждение, потом удаляем исходное, через 4 сек удаляем предупреждение
+        await _warn_and_delete(msg, "🚫 Сообщение удалено: недопустимые символы.", warn_delete_after=4)
         return
 
     # Мат
@@ -1077,14 +1107,8 @@ async def moderate_message(msg: Message):
         stats["swear"] += 1
         stats["msg_deleted"] += 1
         db_save_stats()
-        try:
-            await msg.delete()
-            # FIX: отправляем в тред, чтобы было видно в комментариях
-            warn = await _send_in_thread(chat_id, thread_id, SWEAR_REPLY)
-            if warn:
-                asyncio.create_task(_delete_message_after(chat_id, warn.message_id, 10))
-        except Exception:
-            pass
+        # Сначала реплай-предупреждение, потом удаляем исходное, через 4 сек удаляем предупреждение
+        await _warn_and_delete(msg, SWEAR_REPLY, warn_delete_after=4)
         return
 
     # Copy-paste flood
@@ -1093,26 +1117,21 @@ async def moderate_message(msg: Message):
         stats["msg_deleted"] += 1
         db_save_stats()
         try:
-            await msg.delete()
-        except Exception:
-            pass
-        try:
             await bot.restrict_chat_member(
                 chat_id, user_id,
                 permissions=ChatPermissions(can_send_messages=False),
                 until_date=int(time.time()) + 60
             )
-            # FIX: отправляем в тред, чтобы было видно в комментариях
-            warn_msg = await _send_in_thread(
-                chat_id, thread_id,
-                "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(
-                    user_id, full_name)
-            )
-            if warn_msg:
-                asyncio.create_task(_delete_message_after(chat_id, warn_msg.message_id, 15))
-            copypaste_tracker.pop(key, None)
         except Exception as e:
             logging.warning("copypaste mute failed %s: %s", user_id, e)
+        copypaste_tracker.pop(key, None)
+        # Сначала реплай-предупреждение, потом удаляем исходное, через 4 сек удаляем предупреждение
+        await _warn_and_delete(
+            msg,
+            "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(
+                user_id, full_name),
+            warn_delete_after=4,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -1122,7 +1141,7 @@ async def main():
     global BOT_ID
     me = await bot.get_me()
     BOT_ID = me.id
-    logging.info("Bot started: @%s (id=%d)", me.username, BOT_ID)
+    logging.info("Bot started: @%s (id=%d)", me.username, me.id)
 
     await dp.start_polling(
         bot,
