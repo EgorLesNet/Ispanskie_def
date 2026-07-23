@@ -3,7 +3,6 @@ import re
 import time
 import json
 import os
-import random
 import logging
 from collections import deque
 from datetime import datetime
@@ -32,7 +31,6 @@ def has_cn_or_ar(text):
 # ─────────────────────────────────────────────
 # SWEAR FILTER
 # ─────────────────────────────────────────────
-# Базовый список мата (корни слов, регистронезависимо)
 DEFAULT_SWEAR_WORDS = [
     "блять", "бля", "блядь", "блин",
     "пизд", "пиздец", "пиздит", "пиздёж",
@@ -173,7 +171,7 @@ logging.info("Loaded %d verified users, %d whitelist, %d channels from db.json",
 
 # join_flood: {chat_id: deque of (timestamp, user_id, full_name)}
 join_flood = {}
-captcha_pending = {}  # (chat_id, user_id) -> {msg_id, expire, answer}
+captcha_pending = {}  # (chat_id, user_id) -> {msg_id, expire}
 copypaste_tracker = {}  # (chat_id, user_id): deque of (ts, hash)
 
 CAPTCHA_SUCCESS_DELETE_AFTER = 20
@@ -211,44 +209,15 @@ def has_swear(text: str) -> bool:
     return bool(swear_re.search(text))
 
 # ─────────────────────────────────────────────
-# MATH CAPTCHA
+# BUTTON CAPTCHA (одна кнопка "Я не бот")
 # ─────────────────────────────────────────────
-def gen_math_captcha():
-    a = random.randint(1, 15)
-    b = random.randint(1, 15)
-    op = random.choice(["+", "-", "*"])
-    if op == "+":
-        answer = a + b
-        question = "{} + {}".format(a, b)
-    elif op == "-":
-        if a < b:
-            a, b = b, a
-        answer = a - b
-        question = "{} - {}".format(a, b)
-    else:
-        a = random.randint(2, 9)
-        b = random.randint(2, 9)
-        answer = a * b
-        question = "{} × {}".format(a, b)
-    wrong = set()
-    while len(wrong) < 3:
-        delta = random.choice([-3, -2, -1, 1, 2, 3])
-        w = answer + delta
-        if w != answer and w >= 0:
-            wrong.add(w)
-    return question, answer, list(wrong)
-
-def make_captcha_keyboard(chat_id, user_id, correct, wrongs):
-    options = wrongs + [correct]
-    random.shuffle(options)
-    buttons = [
+def make_captcha_keyboard(chat_id, user_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text=str(opt),
-            callback_data="mathcap_{}_{}_{}".format(chat_id, user_id, opt)
+            text="✅ Я не бот",
+            callback_data="btncap_{}_{}".format(chat_id, user_id)
         )
-        for opt in options
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[buttons[:2], buttons[2:]])
+    ]])
 
 # ─────────────────────────────────────────────
 # COPY-PASTE FLOOD
@@ -386,19 +355,16 @@ async def on_new_member(event: ChatMemberUpdated):
     except Exception as e:
         logging.warning("restrict failed %s: %s", user_id, e)
 
-    await _send_math_captcha(chat_id, user_id, full_name, reply_to=None)
+    await _send_button_captcha(chat_id, user_id, full_name)
 
 
-async def _send_math_captcha(chat_id, user_id, full_name, reply_to=None):
-    question, answer, wrongs = gen_math_captcha()
-    keyboard = make_captcha_keyboard(chat_id, user_id, answer, wrongs)
+async def _send_button_captcha(chat_id, user_id, full_name, reply_to=None):
+    keyboard = make_captcha_keyboard(chat_id, user_id)
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
     text = (
-        "🧠 {}, добро пожаловать!\n\n"
-        "Реши при��ер за <b>{} сек</b>, чтобы подтвердить, что вы не бот:\n\n"
-        "<b>{} = ?</b>\n\n"
-        "Выберите правильный ответ:"
-    ).format(mention, CAPTCHA_TIMEOUT, question)
+        "👋 {}, добро пожаловать!\n\n"
+        "Нажми кнопку ниже за <b>{} сек</b>, чтобы подтвердить, что ты не бот:"
+    ).format(mention, CAPTCHA_TIMEOUT)
     try:
         kwargs = dict(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard)
         if reply_to:
@@ -407,7 +373,6 @@ async def _send_math_captcha(chat_id, user_id, full_name, reply_to=None):
         captcha_pending[(chat_id, user_id)] = {
             "msg_id": captcha_msg.message_id,
             "expire": time.time() + CAPTCHA_TIMEOUT,
-            "answer": answer
         }
         asyncio.create_task(_captcha_timeout(chat_id, user_id, full_name, captcha_msg.message_id))
     except Exception as e:
@@ -437,14 +402,13 @@ async def _captcha_timeout(chat_id, user_id, full_name, captcha_msg_id):
 
 
 # ─────────────────────────────────────────────
-# MATH CAPTCHA CALLBACK
+# BUTTON CAPTCHA CALLBACK
 # ─────────────────────────────────────────────
-@dp.callback_query(F.data.startswith("mathcap_"))
-async def cb_math_captcha(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("btncap_"))
+async def cb_button_captcha(call: CallbackQuery):
     parts = call.data.split("_")
     chat_id = int(parts[1])
     user_id = int(parts[2])
-    chosen = int(parts[3])
 
     if call.from_user.id != user_id:
         await call.answer("Эта капча не для вас.", show_alert=True)
@@ -455,30 +419,10 @@ async def cb_math_captcha(call: CallbackQuery):
         await call.answer("Капча уже недействительна.", show_alert=True)
         return
 
-    correct = pending["answer"]
     full_name = call.from_user.full_name
-
-    if chosen != correct:
-        captcha_pending.pop((chat_id, user_id), None)
-        stats["captcha_fail"] += 1
-        stats["total"] += 1
-        db_save_stats()
-        _kick_log(user_id, full_name, chat_id, connected_channels.get(chat_id, str(chat_id)), "капча wrong answer")
-        try:
-            await call.message.edit_text("❌ {} ошибся — исключён.".format(full_name), parse_mode="HTML")
-            asyncio.create_task(_delete_message_after(call.message.chat.id, call.message.message_id, 5))
-        except Exception:
-            pass
-        try:
-            await bot.ban_chat_member(chat_id, user_id)
-            await bot.unban_chat_member(chat_id, user_id)
-        except Exception as e:
-            logging.warning("kick after wrong captcha %s: %s", user_id, e)
-        await call.answer("❌ Неверный ответ!", show_alert=True)
-        return
-
     captcha_pending.pop((chat_id, user_id), None)
     db_add_verified(chat_id, user_id)
+
     try:
         await bot.restrict_chat_member(
             chat_id, user_id,
@@ -495,12 +439,14 @@ async def cb_math_captcha(call: CallbackQuery):
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
     try:
         await call.message.edit_text(
-            "✅ {} прошёл проверку и может писать!".format(mention), parse_mode="HTML")
+            "✅ {} подтвердил, что не бот — добро пожаловать!".format(mention),
+            parse_mode="HTML"
+        )
         asyncio.create_task(
             _delete_message_after(call.message.chat.id, call.message.message_id, CAPTCHA_SUCCESS_DELETE_AFTER))
     except Exception:
         pass
-    await call.answer("✅ Правильно! Добро пожаловать.")
+    await call.answer("✅ Добро пожаловать!")
 
 
 # ─────────────────────────────────────────────
@@ -545,7 +491,7 @@ async def moderate_message(msg: Message):
             except Exception:
                 pass
             return
-        await _send_math_captcha(chat_id, user_id, full_name, reply_to=msg.message_id)
+        await _send_button_captcha(chat_id, user_id, full_name, reply_to=msg.message_id)
         try:
             await msg.delete()
             stats["msg_deleted"] += 1
