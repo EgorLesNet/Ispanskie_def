@@ -78,6 +78,9 @@ DEFAULT_DB = {
     "swear_words": None
 }
 
+# Глобальный lock для защиты от race condition при записи в БД
+_db_lock = asyncio.Lock()
+
 def db_read() -> dict:
     if not os.path.exists(DB_PATH):
         return {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
@@ -109,50 +112,57 @@ def db_write(data: dict):
 async def db_write_async(data: dict):
     await asyncio.to_thread(db_write, data)
 
-def db_add_verified(chat_id: int, user_id: int):
+async def db_add_verified(chat_id: int, user_id: int):
     verified_users.add((chat_id, user_id))
-    d = db_read()
-    d["verified_users"] = [list(p) for p in verified_users]
-    asyncio.create_task(db_write_async(d))
+    async with _db_lock:
+        d = db_read()
+        d["verified_users"] = [list(p) for p in verified_users]
+        await db_write_async(d)
 
-def db_save_stats():
-    d = db_read()
-    d["stats"] = stats
-    asyncio.create_task(db_write_async(d))
+async def db_save_stats():
+    async with _db_lock:
+        d = db_read()
+        d["stats"] = stats
+        await db_write_async(d)
 
-def db_save_settings():
-    d = db_read()
-    d["settings"] = {
-        "flood_threshold": flood_threshold,
-        "flood_window": flood_window,
-        "captcha_timeout": CAPTCHA_TIMEOUT,
-        "copypaste_limit": COPYPASTE_LIMIT
-    }
-    asyncio.create_task(db_write_async(d))
+async def db_save_settings():
+    async with _db_lock:
+        d = db_read()
+        d["settings"] = {
+            "flood_threshold": flood_threshold,
+            "flood_window": flood_window,
+            "captcha_timeout": CAPTCHA_TIMEOUT,
+            "copypaste_limit": COPYPASTE_LIMIT
+        }
+        await db_write_async(d)
 
-def db_save_whitelist():
-    d = db_read()
-    d["whitelist"] = list(whitelist)
-    asyncio.create_task(db_write_async(d))
+async def db_save_whitelist():
+    async with _db_lock:
+        d = db_read()
+        d["whitelist"] = list(whitelist)
+        await db_write_async(d)
 
-def db_save_channels():
-    d = db_read()
-    d["connected_channels"] = {str(k): v for k, v in connected_channels.items()}
-    asyncio.create_task(db_write_async(d))
+async def db_save_channels():
+    async with _db_lock:
+        d = db_read()
+        d["connected_channels"] = {str(k): v for k, v in connected_channels.items()}
+        await db_write_async(d)
 
-def db_save_swear_words():
-    d = db_read()
-    d["swear_words"] = list(swear_words)
-    asyncio.create_task(db_write_async(d))
+async def db_save_swear_words():
+    async with _db_lock:
+        d = db_read()
+        d["swear_words"] = list(swear_words)
+        await db_write_async(d)
 
-def db_add_kick_log(entry: dict):
-    d = db_read()
-    log = d.get("kick_log", [])
-    log.append(entry)
-    if len(log) > 1000:
-        log = log[-1000:]
-    d["kick_log"] = log
-    asyncio.create_task(db_write_async(d))
+async def db_add_kick_log(entry: dict):
+    async with _db_lock:
+        d = db_read()
+        log = d.get("kick_log", [])
+        log.append(entry)
+        if len(log) > 1000:
+            log = log[-1000:]
+        d["kick_log"] = log
+        await db_write_async(d)
 
 # ─────────────────────────────────────────────
 # INIT RUNTIME STATE FROM DB
@@ -233,8 +243,8 @@ async def _delete_message_after(chat_id: int, message_id: int, delay: int):
     except Exception:
         pass
 
-def _kick_log(user_id, name, chat_id, chat_title, reason):
-    db_add_kick_log({
+async def _kick_log(user_id, name, chat_id, chat_title, reason):
+    await db_add_kick_log({
         "user_id": user_id,
         "name": name,
         "chat_id": chat_id,
@@ -245,9 +255,6 @@ def _kick_log(user_id, name, chat_id, chat_title, reason):
 
 # ─────────────────────────────────────────────
 # THREAD-AWARE reply helper
-# Отправляет предупреждение как реплай на сообщение пользователя,
-# затем удаляет исходное сообщение и через `warn_delete_after` сек
-# удаляет само предупреждение — чтобы пользователь точно видел факт удаления.
 # ─────────────────────────────────────────────
 async def _warn_and_delete(
     msg: Message,
@@ -255,11 +262,6 @@ async def _warn_and_delete(
     parse_mode: str = "HTML",
     warn_delete_after: int = 4,
 ) -> None:
-    """
-    1. Отправляет предупреждение реплаем на msg (reply_to_message_id=msg.message_id).
-    2. Удаляет исходное сообщение msg.
-    3. Через warn_delete_after секунд удаляет само предупреждение.
-    """
     warn_msg = None
     try:
         warn_msg = await bot.send_message(
@@ -272,13 +274,11 @@ async def _warn_and_delete(
     except Exception as e:
         logging.warning("_warn_and_delete send failed: %s", e)
 
-    # Удаляем исходное сообщение
     try:
         await msg.delete()
     except Exception:
         pass
 
-    # Откладываем удаление предупреждения
     if warn_msg:
         asyncio.create_task(
             _delete_message_after(msg.chat.id, warn_msg.message_id, warn_delete_after)
@@ -287,7 +287,6 @@ async def _warn_and_delete(
 
 async def _send_in_thread(chat_id: int, thread_id: int | None, text: str,
                           parse_mode: str = "HTML", **kwargs) -> "Message | None":
-    """Отправляет сообщение в тред (комментарии), если thread_id задан."""
     try:
         return await bot.send_message(
             chat_id, text,
@@ -365,7 +364,7 @@ async def on_new_member(event: ChatMemberUpdated):
 
     if user_id == BOT_ID:
         connected_channels[chat_id] = chat_title
-        db_save_channels()
+        asyncio.create_task(db_save_channels())
         for admin_id in config.ADMIN_IDS:
             try:
                 await bot.send_message(
@@ -378,7 +377,7 @@ async def on_new_member(event: ChatMemberUpdated):
         return
 
     if user_id in whitelist:
-        db_add_verified(chat_id, user_id)
+        asyncio.create_task(db_add_verified(chat_id, user_id))
         return
 
     full_name = user.full_name or str(user_id)
@@ -386,11 +385,11 @@ async def on_new_member(event: ChatMemberUpdated):
     if has_cn_or_ar(full_name + (user.username or "")):
         stats["cn_ar"] += 1
         stats["total"] += 1
-        db_save_stats()
+        asyncio.create_task(db_save_stats())
         try:
             await bot.ban_chat_member(chat_id, user_id)
             await bot.unban_chat_member(chat_id, user_id)
-            _kick_log(user_id, full_name, chat_id, chat_title, "cn/ar ник")
+            asyncio.create_task(_kick_log(user_id, full_name, chat_id, chat_title, "cn/ar ник"))
             await _notify_admins("🚫 <b>Кикнут:</b> {} (<code>{}</code>)\n<b>Причина:</b> cn/ar ник\n<b>Чат:</b> {}".format(
                 full_name, user_id, chat_title))
         except Exception as e:
@@ -414,11 +413,11 @@ async def on_new_member(event: ChatMemberUpdated):
                                 pass
                 stats["flood"] += 1
                 stats["total"] += 1
-                _kick_log(uid, name, chat_id, chat_title, "flood join")
+                asyncio.create_task(_kick_log(uid, name, chat_id, chat_title, "flood join"))
                 kicked_names.append("{} (<code>{}</code>)".format(name, uid))
             except Exception as e:
                 logging.warning("flood kick failed %s: %s", uid, e)
-        db_save_stats()
+        asyncio.create_task(db_save_stats())
         if kicked_names:
             await _notify_admins(
                 "🌊 <b>Флуд-кик:</b> {} чел.\n{}\n<b>Чат:</b> {}".format(
@@ -486,7 +485,7 @@ async def _captcha_timeout(chat_id: int, user_id: int,
     captcha_pending.pop((chat_id, user_id), None)
     stats["captcha_fail"] += 1
     stats["msg_deleted"] += 1
-    db_save_stats()
+    await db_save_stats()
 
     for mid in (captcha_msg_id, user_msg_id):
         try:
@@ -522,7 +521,7 @@ async def cb_button_captcha(call: CallbackQuery):
 
     full_name = call.from_user.full_name
     captcha_pending.pop((chat_id, user_id), None)
-    db_add_verified(chat_id, user_id)
+    await db_add_verified(chat_id, user_id)
 
     try:
         await bot.restrict_chat_member(
@@ -822,7 +821,7 @@ async def cmd_setflood(msg: Message):
         return
     flood_threshold = int(parts[1])
     flood_window = int(parts[2])
-    db_save_settings()
+    await db_save_settings()
     await msg.answer("✅ Flood-порог: <b>{} чел. за {} сек.</b>".format(flood_threshold, flood_window), parse_mode="HTML")
 
 @dp.message(Command("setcaptcha"))
@@ -835,7 +834,7 @@ async def cmd_setcaptcha(msg: Message):
         await msg.answer("Использование: <code>/setcaptcha [секунд]</code>", parse_mode="HTML")
         return
     CAPTCHA_TIMEOUT = int(parts[1])
-    db_save_settings()
+    await db_save_settings()
     await msg.answer("✅ Таймаут капчи: <b>{} сек.</b>".format(CAPTCHA_TIMEOUT), parse_mode="HTML")
 
 @dp.message(Command("setcopypaste"))
@@ -848,7 +847,7 @@ async def cmd_setcopypaste(msg: Message):
         await msg.answer("Использование: <code>/setcopypaste [N]</code> (мин. 2)", parse_mode="HTML")
         return
     COPYPASTE_LIMIT = int(parts[1])
-    db_save_settings()
+    await db_save_settings()
     await msg.answer("✅ Лимит copypaste: <b>{}</b> подряд.".format(COPYPASTE_LIMIT), parse_mode="HTML")
 
 @dp.message(Command("settings"))
@@ -879,7 +878,7 @@ async def cmd_addswear(msg: Message):
     word = parts[1].strip().lower()
     swear_words.add(word)
     swear_re = _build_swear_re(swear_words)
-    db_save_swear_words()
+    await db_save_swear_words()
     await msg.answer("✅ Слово <code>{}</code> добавлено в фильтр.".format(word), parse_mode="HTML")
 
 @dp.message(Command("removeswear"))
@@ -894,7 +893,7 @@ async def cmd_removeswear(msg: Message):
     word = parts[1].strip().lower()
     swear_words.discard(word)
     swear_re = _build_swear_re(swear_words)
-    db_save_swear_words()
+    await db_save_swear_words()
     await msg.answer("✅ Слово <code>{}</code> удалено из фильтра.".format(word), parse_mode="HTML")
 
 @dp.message(Command("listswear"))
@@ -933,7 +932,7 @@ async def cmd_whitelist(msg: Message):
         else:
             whitelist.discard(uid)
             await msg.answer("✅ <code>{}</code> удалён из whitelist.".format(uid), parse_mode="HTML")
-        db_save_whitelist()
+        await db_save_whitelist()
     else:
         await msg.answer("Неверный формат. Напиши /help")
 
@@ -970,7 +969,7 @@ async def cmd_addchannel(msg: Message):
     try:
         chat = await bot.get_chat(cid)
         connected_channels[cid] = chat.title or str(cid)
-        db_save_channels()
+        await db_save_channels()
         await msg.answer("✅ Подключён: <b>{}</b> (<code>{}</code>)".format(chat.title or "—", cid), parse_mode="HTML")
     except Exception as e:
         await msg.answer("❌ Ошибка: <code>{}</code>".format(e), parse_mode="HTML")
@@ -986,7 +985,7 @@ async def cmd_removechannel(msg: Message):
     cid = int(parts[1])
     if cid in connected_channels:
         title = connected_channels.pop(cid)
-        db_save_channels()
+        await db_save_channels()
         await msg.answer("✅ Канал <b>{}</b> отключён.".format(title), parse_mode="HTML")
     else:
         await msg.answer("❌ Канал не найден.", parse_mode="HTML")
@@ -999,7 +998,7 @@ async def cb_removechan(call: CallbackQuery):
     cid = int(call.data.split("_", 1)[1])
     if cid in connected_channels:
         title = connected_channels.pop(cid)
-        db_save_channels()
+        await db_save_channels()
         await call.answer("Канал «{}» отключён.".format(title), show_alert=True)
         await call.message.edit_reply_markup(reply_markup=None)
         await call.message.answer("✅ Канал <b>{}</b> отключён.".format(title), parse_mode="HTML")
@@ -1085,7 +1084,7 @@ async def moderate_message(msg: Message):
             try:
                 await msg.delete()
                 stats["msg_deleted"] += 1
-                db_save_stats()
+                asyncio.create_task(db_save_stats())
             except Exception:
                 pass
             return
@@ -1097,8 +1096,7 @@ async def moderate_message(msg: Message):
     # CN/AR текст
     if has_cn_or_ar(text):
         stats["msg_deleted"] += 1
-        db_save_stats()
-        # Сначала реплай-предупреждение, потом удаляем исходное, через 4 сек удаляем предупреждение
+        asyncio.create_task(db_save_stats())
         await _warn_and_delete(msg, "🚫 Сообщение удалено: недопустимые символы.", warn_delete_after=4)
         return
 
@@ -1106,8 +1104,7 @@ async def moderate_message(msg: Message):
     if text and has_swear(text):
         stats["swear"] += 1
         stats["msg_deleted"] += 1
-        db_save_stats()
-        # Сначала реплай-предупреждение, потом удаляем исходное, через 4 сек удаляем предупреждение
+        asyncio.create_task(db_save_stats())
         await _warn_and_delete(msg, SWEAR_REPLY, warn_delete_after=4)
         return
 
@@ -1115,7 +1112,7 @@ async def moderate_message(msg: Message):
     if text and check_copypaste(chat_id, user_id, text):
         stats["copypaste"] += 1
         stats["msg_deleted"] += 1
-        db_save_stats()
+        asyncio.create_task(db_save_stats())
         try:
             await bot.restrict_chat_member(
                 chat_id, user_id,
@@ -1125,7 +1122,6 @@ async def moderate_message(msg: Message):
         except Exception as e:
             logging.warning("copypaste mute failed %s: %s", user_id, e)
         copypaste_tracker.pop(key, None)
-        # Сначала реплай-предупреждение, потом удаляем исходное, через 4 сек удаляем предупреждение
         await _warn_and_delete(
             msg,
             "⚠️ <a href='tg://user?id={}'>{}</a>, обнаружен копипаст спам! Мют <b>60 сек</b>.".format(
