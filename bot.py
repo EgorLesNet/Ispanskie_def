@@ -1242,6 +1242,7 @@ async def main():
             "callback_query",
             "chat_member",
             "my_chat_member",
+            "channel_post",
         ]
     )
 
