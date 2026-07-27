@@ -5,6 +5,7 @@ import json
 import os
 import logging
 import hashlib
+from groq import AsyncGroq
 from collections import deque
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
@@ -21,6 +22,7 @@ import config
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
+groq_client = AsyncGroq(api_key=config.GROQ_API_KEY)
 
 BOT_ID: int = 0
 
@@ -1129,6 +1131,100 @@ async def moderate_message(msg: Message):
             warn_delete_after=4,
         )
 
+
+
+# ─────────────────────────────────────────────
+# GROQ AI — генерация опроса по тексту поста
+# ─────────────────────────────────────────────
+async def _generate_poll_via_groq(text: str) -> dict | None:
+    prompt = (
+        "Ты редактор новостного Telegram-канала о жизни района Испанские кварталы в Москве. "
+        "На основе поста придумай один короткий и понятный вопрос для опроса "
+        "(до 255 символов) и ровно 4 варианта ответа (каждый до 100 символов). "
+        "Опрос должен соответствовать тематике районного канала: соседи, инфраструктура, "
+        "благоустройство, транспорт, безопасность, сервисы, локальные новости. "
+        "Пиши на русском. "
+        "Отвечай СТРОГО JSON без пояснений: "
+        '{"question":"...","options":["...","...","...","..."]}\n\n'
+        "Пост:\n" + text[:3000]
+    )
+
+    try:
+        resp = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.6,
+            max_tokens=400,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        data = json.loads(raw)
+
+        question = str(data.get("question", "")).strip()
+        options = data.get("options", [])
+
+        if not question or not isinstance(options, list):
+            return None
+
+        options = [str(x).strip() for x in options if str(x).strip()]
+        if len(options) < 2:
+            return None
+
+        return {
+            "question": question[:255],
+            "options": options[:10]
+        }
+    except Exception as e:
+        logging.warning("Groq poll generation failed: %s", e)
+        return None
+
+
+# ─────────────────────────────────────────────
+# CHANNEL POST HANDLER — правила + опрос
+# ─────────────────────────────────────────────
+@dp.channel_post()
+async def on_channel_post(msg: Message):
+    if msg.chat.id != config.CHANNEL_ID:
+        return
+
+    post_id = msg.message_id
+    text = msg.text or msg.caption or ""
+
+    try:
+        await bot.send_message(
+            chat_id=msg.chat.id,
+            text=config.CHANNEL_RULES,
+            parse_mode="HTML",
+            reply_to_message_id=post_id,
+        )
+    except Exception as e:
+        logging.warning("Failed to send channel rules under post %s: %s", post_id, e)
+
+    if not text.strip():
+        return
+
+    poll_data = await _generate_poll_via_groq(text)
+    if not poll_data:
+        return
+
+    question = poll_data["question"][:255]
+    options = [o[:100] for o in poll_data["options"][:10]]
+
+    if len(options) < 2:
+        return
+
+    try:
+        await bot.send_poll(
+            chat_id=msg.chat.id,
+            question=question,
+            options=options,
+            is_anonymous=True,
+            allows_multiple_answers=False,
+            reply_to_message_id=post_id,
+        )
+    except Exception as e:
+        logging.warning("Failed to send poll under post %s: %s", post_id, e)
 
 # ─────────────────────────────────────────────
 # MAIN
