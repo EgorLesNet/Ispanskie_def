@@ -444,8 +444,8 @@ async def _send_captcha_for_message(chat_id: int, user_id: int, full_name: str,
     keyboard = make_captcha_keyboard(chat_id, user_id)
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
     text = (
-        "👋 {}, подтверди что ты не бот — нажми кнопку за <b>{} сек</b>.\n"
-        "Если не подтвердишь — сообщение будет удалено."
+        "👋 {}, подтвердите что вы не бот — нажмите кнопку за <b>{} сек</b>.\n"
+        "Если не подтвердите — ваше сообщение будет удалено."
     ).format(mention, CAPTCHA_TIMEOUT)
 
     try:
@@ -547,7 +547,7 @@ async def cb_button_captcha(call: CallbackQuery):
     mention = '<a href="tg://user?id={}">{}</a>'.format(user_id, full_name)
     try:
         await call.message.edit_text(
-            "✅ {} подтвердил, что не бот!".format(mention),
+            "✅ {} вы подтвердили, что не бот!".format(mention),
             parse_mode="HTML",
             reply_markup=None
         )
