@@ -1176,66 +1176,98 @@ async def _generate_poll_via_groq(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────
-# ОТПРАВКА В ТРЕД КОММЕНТАРИЕВ С RETRY
+# ОТПРАВКА ПЕРВОГО КОММЕНТАРИЯ В LINKED-ЧАТ
 #
-# Telegram создаёт тред в группе комментариев не мгновенно.
-# Ждём до THREAD_WAIT_MAX секунд с шагом THREAD_WAIT_STEP,
-# пробуя отправить сообщение. Если тред ещё не готов —
-# Telegram вернёт ошибку "message thread not found", ждём ещё.
+# Telegram при публикации поста в канале автоматически создаёт
+# тред в привязанной группе обсуждений. ID треда = ID поста в канале.
+# Отправляем сообщение в linked_chat_id с reply_to_message_id=post_id —
+# это делает его первым комментарием под постом.
+# Если linked_chat_id не получен из config, запрашиваем его через
+# bot.get_chat(CHANNEL_ID).linked_chat_id один раз и кэшируем.
 # ─────────────────────────────────────────────
-THREAD_WAIT_STEP = 3   # секунд между попытками
-THREAD_WAIT_MAX  = 15  # максимум ожиданий (итого до 15 сек)
+_linked_chat_id_cache: int | None = None
 
-async def _send_to_thread_with_retry(
-    chat_id: int,
-    thread_id: int,
-    text: str | None = None,
-    poll_data: dict | None = None,
-) -> bool:
+async def _get_linked_chat_id() -> int | None:
+    global _linked_chat_id_cache
+    if _linked_chat_id_cache is not None:
+        return _linked_chat_id_cache
+
+    # Приоритет: явно заданный в config
+    comments_chat_id = getattr(config, "COMMENTS_CHAT_ID", None)
+    if comments_chat_id:
+        _linked_chat_id_cache = int(comments_chat_id)
+        return _linked_chat_id_cache
+
+    # Автодетект через linked_chat
+    try:
+        channel_chat = await bot.get_chat(config.CHANNEL_ID)
+        linked = getattr(channel_chat, "linked_chat_id", None)
+        if linked:
+            _linked_chat_id_cache = linked
+            logging.info("Автодетект linked_chat_id: %d", linked)
+            return _linked_chat_id_cache
+    except Exception as e:
+        logging.warning("Не удалось получить linked_chat_id: %s", e)
+
+    return None
+
+
+COMMENT_WAIT_STEP = 2   # секунд между попытками
+COMMENT_WAIT_MAX  = 20  # максимум секунд ожидания
+
+async def _post_first_comment(linked_chat_id: int, post_id: int,
+                               text: str | None = None,
+                               poll_data: dict | None = None) -> bool:
     """
-    Пробует отправить сообщение или опрос в тред треда комментариев.
-    Повторяет попытку каждые THREAD_WAIT_STEP сек если тред ещё не создан.
-    Возвращает True при успехе.
+    Отправляет сообщение или опрос как комментарий к посту.
+    Использует reply_to_message_id=post_id в linked-чате.
+    Telegram создаёт тред не мгновенно, поэтому повторяем до COMMENT_WAIT_MAX сек.
     """
     elapsed = 0
-    while elapsed <= THREAD_WAIT_MAX:
-        await asyncio.sleep(THREAD_WAIT_STEP)
-        elapsed += THREAD_WAIT_STEP
+    while elapsed <= COMMENT_WAIT_MAX:
+        await asyncio.sleep(COMMENT_WAIT_STEP)
+        elapsed += COMMENT_WAIT_STEP
         try:
             if text is not None:
                 await bot.send_message(
-                    chat_id=chat_id,
+                    chat_id=linked_chat_id,
                     text=text,
                     parse_mode="HTML",
-                    message_thread_id=thread_id,
+                    reply_to_message_id=post_id,
                 )
             elif poll_data is not None:
                 await bot.send_poll(
-                    chat_id=chat_id,
+                    chat_id=linked_chat_id,
                     question=poll_data["question"],
                     options=poll_data["options"],
                     is_anonymous=True,
                     allows_multiple_answers=False,
-                    message_thread_id=thread_id,
+                    reply_to_message_id=post_id,
                 )
             return True
         except Exception as e:
             err = str(e).lower()
-            if "thread" in err or "not found" in err or "invalid" in err:
+            if "message to reply not found" in err or "replied message not found" in err \
+                    or "thread" in err or "not found" in err:
                 logging.info(
-                    "_send_to_thread_with_retry: тред %s ещё не готов (%ds), повтор... ошибка: %s",
-                    thread_id, elapsed, e
+                    "_post_first_comment: пост %s ещё не готов (%ds), повтор... %s",
+                    post_id, elapsed, e
                 )
                 continue
-            # Любая другая ошибка — не ретраим
-            logging.warning("_send_to_thread_with_retry: неожиданная ошибка chat=%s thread=%s: %s", chat_id, thread_id, e)
+            logging.warning(
+                "_post_first_comment: ошибка chat=%s post=%s: %s",
+                linked_chat_id, post_id, e
+            )
             return False
-    logging.warning("_send_to_thread_with_retry: тред %s так и не появился за %ds", thread_id, THREAD_WAIT_MAX)
+    logging.warning(
+        "_post_first_comment: пост %s не появился в linked-чате за %ds",
+        post_id, COMMENT_WAIT_MAX
+    )
     return False
 
 
 # ─────────────────────────────────────────────
-# CHANNEL POST HANDLER — правила + опрос
+# CHANNEL POST HANDLER — правила + опрос первым комментарием
 # ─────────────────────────────────────────────
 @dp.channel_post()
 async def on_channel_post(msg: Message):
@@ -1245,33 +1277,34 @@ async def on_channel_post(msg: Message):
     post_id = msg.message_id
     text = msg.text or msg.caption or ""
 
-    comments_chat_id = getattr(config, "COMMENTS_CHAT_ID", None)
+    linked_chat_id = await _get_linked_chat_id()
 
-    if comments_chat_id:
-        # Отправляем правила в тред группы комментариев с retry
+    if linked_chat_id:
+        # Сначала отправляем правила — они станут первым комментарием
         asyncio.create_task(
-            _send_to_thread_with_retry(
-                chat_id=comments_chat_id,
-                thread_id=post_id,
+            _post_first_comment(
+                linked_chat_id=linked_chat_id,
+                post_id=post_id,
                 text=config.CHANNEL_RULES,
             )
         )
 
-        # Генерируем опрос параллельно (пока ждём тред)
+        # Параллельно генерируем опрос и отправляем вторым комментарием
         if text.strip():
             poll_data = await _generate_poll_via_groq(text)
             if poll_data and len(poll_data.get("options", [])) >= 2:
                 poll_data["question"] = poll_data["question"][:255]
                 poll_data["options"] = [o[:100] for o in poll_data["options"][:10]]
                 asyncio.create_task(
-                    _send_to_thread_with_retry(
-                        chat_id=comments_chat_id,
-                        thread_id=post_id,
+                    _post_first_comment(
+                        linked_chat_id=linked_chat_id,
+                        post_id=post_id,
                         poll_data=poll_data,
                     )
                 )
     else:
-        # Фоллбэк если COMMENTS_CHAT_ID не задан
+        # Фоллбэк: linked-чат не найден — шлём в сам канал как reply
+        logging.warning("linked_chat_id не определён, отправляем reply в канал (фоллбэк)")
         try:
             await bot.send_message(
                 chat_id=msg.chat.id,
