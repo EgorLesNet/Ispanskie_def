@@ -80,7 +80,6 @@ DEFAULT_DB = {
     "swear_words": None
 }
 
-# Глобальный lock для защиты от race condition при записи в БД
 _db_lock = asyncio.Lock()
 
 def db_read() -> dict:
@@ -1095,14 +1094,12 @@ async def moderate_message(msg: Message):
 
     text = msg.text or msg.caption or ""
 
-    # CN/AR текст
     if has_cn_or_ar(text):
         stats["msg_deleted"] += 1
         asyncio.create_task(db_save_stats())
         await _warn_and_delete(msg, "🚫 Сообщение удалено: недопустимые символы.", warn_delete_after=4)
         return
 
-    # Мат
     if text and has_swear(text):
         stats["swear"] += 1
         stats["msg_deleted"] += 1
@@ -1110,7 +1107,6 @@ async def moderate_message(msg: Message):
         await _warn_and_delete(msg, SWEAR_REPLY, warn_delete_after=4)
         return
 
-    # Copy-paste flood
     if text and check_copypaste(chat_id, user_id, text):
         stats["copypaste"] += 1
         stats["msg_deleted"] += 1
@@ -1180,12 +1176,66 @@ async def _generate_poll_via_groq(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────
-# CHANNEL POST HANDLER — правила + опрос
+# ОТПРАВКА В ТРЕД КОММЕНТАРИЕВ С RETRY
 #
-# Как это работает:
-# Telegram при публикации поста в канале создаёт тред в группе комментариев.
-# message_id поста в канале == message_thread_id треда в группе комментариев.
-# Бот должен быть администратором в группе комментариев (COMMENTS_CHAT_ID).
+# Telegram создаёт тред в группе комментариев не мгновенно.
+# Ждём до THREAD_WAIT_MAX секунд с шагом THREAD_WAIT_STEP,
+# пробуя отправить сообщение. Если тред ещё не готов —
+# Telegram вернёт ошибку "message thread not found", ждём ещё.
+# ─────────────────────────────────────────────
+THREAD_WAIT_STEP = 3   # секунд между попытками
+THREAD_WAIT_MAX  = 15  # максимум ожиданий (итого до 15 сек)
+
+async def _send_to_thread_with_retry(
+    chat_id: int,
+    thread_id: int,
+    text: str | None = None,
+    poll_data: dict | None = None,
+) -> bool:
+    """
+    Пробует отправить сообщение или опрос в тред треда комментариев.
+    Повторяет попытку каждые THREAD_WAIT_STEP сек если тред ещё не создан.
+    Возвращает True при успехе.
+    """
+    elapsed = 0
+    while elapsed <= THREAD_WAIT_MAX:
+        await asyncio.sleep(THREAD_WAIT_STEP)
+        elapsed += THREAD_WAIT_STEP
+        try:
+            if text is not None:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    message_thread_id=thread_id,
+                )
+            elif poll_data is not None:
+                await bot.send_poll(
+                    chat_id=chat_id,
+                    question=poll_data["question"],
+                    options=poll_data["options"],
+                    is_anonymous=True,
+                    allows_multiple_answers=False,
+                    message_thread_id=thread_id,
+                )
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if "thread" in err or "not found" in err or "invalid" in err:
+                logging.info(
+                    "_send_to_thread_with_retry: тред %s ещё не готов (%ds), повтор... ошибка: %s",
+                    thread_id, elapsed, e
+                )
+                continue
+            # Любая другая ошибка — не ретраим
+            logging.warning("_send_to_thread_with_retry: неожиданная ошибка chat=%s thread=%s: %s", chat_id, thread_id, e)
+            return False
+    logging.warning("_send_to_thread_with_retry: тред %s так и не появился за %ds", thread_id, THREAD_WAIT_MAX)
+    return False
+
+
+# ─────────────────────────────────────────────
+# CHANNEL POST HANDLER — правила + опрос
 # ─────────────────────────────────────────────
 @dp.channel_post()
 async def on_channel_post(msg: Message):
@@ -1195,24 +1245,33 @@ async def on_channel_post(msg: Message):
     post_id = msg.message_id
     text = msg.text or msg.caption or ""
 
-    # Небольшая задержка — Telegram успевает создать тред в группе комментариев
-    await asyncio.sleep(1)
-
     comments_chat_id = getattr(config, "COMMENTS_CHAT_ID", None)
 
     if comments_chat_id:
-        # Отправляем правила в группу комментариев в тред данного поста
-        try:
-            await bot.send_message(
+        # Отправляем правила в тред группы комментариев с retry
+        asyncio.create_task(
+            _send_to_thread_with_retry(
                 chat_id=comments_chat_id,
+                thread_id=post_id,
                 text=config.CHANNEL_RULES,
-                parse_mode="HTML",
-                message_thread_id=post_id,
             )
-        except Exception as e:
-            logging.warning("Failed to send channel rules to comments chat, post %s: %s", post_id, e)
+        )
+
+        # Генерируем опрос параллельно (пока ждём тред)
+        if text.strip():
+            poll_data = await _generate_poll_via_groq(text)
+            if poll_data and len(poll_data.get("options", [])) >= 2:
+                poll_data["question"] = poll_data["question"][:255]
+                poll_data["options"] = [o[:100] for o in poll_data["options"][:10]]
+                asyncio.create_task(
+                    _send_to_thread_with_retry(
+                        chat_id=comments_chat_id,
+                        thread_id=post_id,
+                        poll_data=poll_data,
+                    )
+                )
     else:
-        # Фоллбэк: если COMMENTS_CHAT_ID не задан — пробуем слать в сам канал
+        # Фоллбэк если COMMENTS_CHAT_ID не задан
         try:
             await bot.send_message(
                 chat_id=msg.chat.id,
@@ -1221,47 +1280,22 @@ async def on_channel_post(msg: Message):
                 reply_to_message_id=post_id,
             )
         except Exception as e:
-            logging.warning("Failed to send channel rules under post %s: %s", post_id, e)
+            logging.warning("Fallback rules failed post %s: %s", post_id, e)
 
-    if not text.strip():
-        return
-
-    poll_data = await _generate_poll_via_groq(text)
-    if not poll_data:
-        return
-
-    question = poll_data["question"][:255]
-    options = [o[:100] for o in poll_data["options"][:10]]
-
-    if len(options) < 2:
-        return
-
-    if comments_chat_id:
-        # Опрос тоже в тред группы комментариев
-        try:
-            await bot.send_poll(
-                chat_id=comments_chat_id,
-                question=question,
-                options=options,
-                is_anonymous=True,
-                allows_multiple_answers=False,
-                message_thread_id=post_id,
-            )
-        except Exception as e:
-            logging.warning("Failed to send poll to comments chat, post %s: %s", post_id, e)
-    else:
-        # Фоллбэк: в канал через reply
-        try:
-            await bot.send_poll(
-                chat_id=msg.chat.id,
-                question=question,
-                options=options,
-                is_anonymous=True,
-                allows_multiple_answers=False,
-                reply_to_message_id=post_id,
-            )
-        except Exception as e:
-            logging.warning("Failed to send poll under post %s: %s", post_id, e)
+        if text.strip():
+            poll_data = await _generate_poll_via_groq(text)
+            if poll_data and len(poll_data.get("options", [])) >= 2:
+                try:
+                    await bot.send_poll(
+                        chat_id=msg.chat.id,
+                        question=poll_data["question"][:255],
+                        options=[o[:100] for o in poll_data["options"][:10]],
+                        is_anonymous=True,
+                        allows_multiple_answers=False,
+                        reply_to_message_id=post_id,
+                    )
+                except Exception as e:
+                    logging.warning("Fallback poll failed post %s: %s", post_id, e)
 
 
 # ─────────────────────────────────────────────
