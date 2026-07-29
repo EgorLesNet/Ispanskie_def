@@ -1176,14 +1176,14 @@ async def _generate_poll_via_groq(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────
-# ОТПРАВКА ПЕРВОГО КОММЕНТАРИЯ В LINKED-ЧАТ
+# ОТПРАВКА КОММЕНТАРИЯ В LINKED-ЧАТ
 #
-# Telegram при публикации поста в канале автоматически создаёт
-# тред в привязанной группе обсуждений. ID треда = ID поста в канале.
-# Отправляем сообщение в linked_chat_id с reply_to_message_id=post_id —
-# это делает его первым комментарием под постом.
-# Если linked_chat_id не получен из config, запрашиваем его через
-# bot.get_chat(CHANNEL_ID).linked_chat_id один раз и кэшируем.
+# Telegram при публикации поста в канале создаёт тред в привязанной
+# группе обсуждений. message_thread_id треда == message_id поста в канале.
+# Чтобы отправить сообщение ВНУТРЬ треда (а не как reply на рандомное
+# сообщение), нужно передавать message_thread_id=post_id.
+# reply_to_message_id здесь НЕ используется — это приводило к тому, что
+# бот отвечал на произвольный пересланный пост вместо нужного треда.
 # ─────────────────────────────────────────────
 _linked_chat_id_cache: int | None = None
 
@@ -1219,8 +1219,10 @@ async def _post_first_comment(linked_chat_id: int, post_id: int,
                                text: str | None = None,
                                poll_data: dict | None = None) -> bool:
     """
-    Отправляет сообщение или опрос как комментарий к посту.
-    Использует reply_to_message_id=post_id в linked-чате.
+    Отправляет сообщение или опрос в тред поста в linked-чате.
+    Использует message_thread_id=post_id — это помещает сообщение
+    непосредственно в тред под постом, а не как reply на произвольное
+    сообщение группы.
     Telegram создаёт тред не мгновенно, поэтому повторяем до COMMENT_WAIT_MAX сек.
     """
     elapsed = 0
@@ -1233,7 +1235,7 @@ async def _post_first_comment(linked_chat_id: int, post_id: int,
                     chat_id=linked_chat_id,
                     text=text,
                     parse_mode="HTML",
-                    reply_to_message_id=post_id,
+                    message_thread_id=post_id,
                 )
             elif poll_data is not None:
                 await bot.send_poll(
@@ -1242,15 +1244,14 @@ async def _post_first_comment(linked_chat_id: int, post_id: int,
                     options=poll_data["options"],
                     is_anonymous=True,
                     allows_multiple_answers=False,
-                    reply_to_message_id=post_id,
+                    message_thread_id=post_id,
                 )
             return True
         except Exception as e:
             err = str(e).lower()
-            if "message to reply not found" in err or "replied message not found" in err \
-                    or "thread" in err or "not found" in err:
+            if "message thread not found" in err or "thread" in err or "not found" in err:
                 logging.info(
-                    "_post_first_comment: пост %s ещё не готов (%ds), повтор... %s",
+                    "_post_first_comment: тред %s ещё не готов (%ds), повтор... %s",
                     post_id, elapsed, e
                 )
                 continue
@@ -1260,7 +1261,7 @@ async def _post_first_comment(linked_chat_id: int, post_id: int,
             )
             return False
     logging.warning(
-        "_post_first_comment: пост %s не появился в linked-чате за %ds",
+        "_post_first_comment: тред %s не появился в linked-чате за %ds",
         post_id, COMMENT_WAIT_MAX
     )
     return False
