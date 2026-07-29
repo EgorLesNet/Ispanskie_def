@@ -1132,7 +1132,6 @@ async def moderate_message(msg: Message):
         )
 
 
-
 # ─────────────────────────────────────────────
 # GROQ AI — генерация опроса по тексту поста
 # ─────────────────────────────────────────────
@@ -1182,6 +1181,11 @@ async def _generate_poll_via_groq(text: str) -> dict | None:
 
 # ─────────────────────────────────────────────
 # CHANNEL POST HANDLER — правила + опрос
+#
+# Как это работает:
+# Telegram при публикации поста в канале создаёт тред в группе комментариев.
+# message_id поста в канале == message_thread_id треда в группе комментариев.
+# Бот должен быть администратором в группе комментариев (COMMENTS_CHAT_ID).
 # ─────────────────────────────────────────────
 @dp.channel_post()
 async def on_channel_post(msg: Message):
@@ -1191,15 +1195,33 @@ async def on_channel_post(msg: Message):
     post_id = msg.message_id
     text = msg.text or msg.caption or ""
 
-    try:
-        await bot.send_message(
-            chat_id=msg.chat.id,
-            text=config.CHANNEL_RULES,
-            parse_mode="HTML",
-            reply_to_message_id=post_id,
-        )
-    except Exception as e:
-        logging.warning("Failed to send channel rules under post %s: %s", post_id, e)
+    # Небольшая задержка — Telegram успевает создать тред в группе комментариев
+    await asyncio.sleep(1)
+
+    comments_chat_id = getattr(config, "COMMENTS_CHAT_ID", None)
+
+    if comments_chat_id:
+        # Отправляем правила в группу комментариев в тред данного поста
+        try:
+            await bot.send_message(
+                chat_id=comments_chat_id,
+                text=config.CHANNEL_RULES,
+                parse_mode="HTML",
+                message_thread_id=post_id,
+            )
+        except Exception as e:
+            logging.warning("Failed to send channel rules to comments chat, post %s: %s", post_id, e)
+    else:
+        # Фоллбэк: если COMMENTS_CHAT_ID не задан — пробуем слать в сам канал
+        try:
+            await bot.send_message(
+                chat_id=msg.chat.id,
+                text=config.CHANNEL_RULES,
+                parse_mode="HTML",
+                reply_to_message_id=post_id,
+            )
+        except Exception as e:
+            logging.warning("Failed to send channel rules under post %s: %s", post_id, e)
 
     if not text.strip():
         return
@@ -1214,17 +1236,33 @@ async def on_channel_post(msg: Message):
     if len(options) < 2:
         return
 
-    try:
-        await bot.send_poll(
-            chat_id=msg.chat.id,
-            question=question,
-            options=options,
-            is_anonymous=True,
-            allows_multiple_answers=False,
-            reply_to_message_id=post_id,
-        )
-    except Exception as e:
-        logging.warning("Failed to send poll under post %s: %s", post_id, e)
+    if comments_chat_id:
+        # Опрос тоже в тред группы комментариев
+        try:
+            await bot.send_poll(
+                chat_id=comments_chat_id,
+                question=question,
+                options=options,
+                is_anonymous=True,
+                allows_multiple_answers=False,
+                message_thread_id=post_id,
+            )
+        except Exception as e:
+            logging.warning("Failed to send poll to comments chat, post %s: %s", post_id, e)
+    else:
+        # Фоллбэк: в канал через reply
+        try:
+            await bot.send_poll(
+                chat_id=msg.chat.id,
+                question=question,
+                options=options,
+                is_anonymous=True,
+                allows_multiple_answers=False,
+                reply_to_message_id=post_id,
+            )
+        except Exception as e:
+            logging.warning("Failed to send poll under post %s: %s", post_id, e)
+
 
 # ─────────────────────────────────────────────
 # MAIN
